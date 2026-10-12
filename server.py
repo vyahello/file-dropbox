@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+Authenticated file-drop server for a local network.
+
+Behavior
+--------
+- Accepts ONLY POST requests (uploads). Every other method -> generic 404 (no Allow header).
+- Requires a bearer token / API key. Missing creds -> 401, bad creds -> 403.
+- Each client lands in its own folder: uploads/<client>/.
+- Records who sent what: date, time, client, IP, OS, User-Agent, filename,
+  size, content-type -> a per-file .meta.json sidecar, a per-client JSONL log,
+  and a combined server access log.
+
+Standard library only. Python 3.8+.
+"""
+
+import hmac
+import json
+import os
+import re
+import secrets
+import sys
+from datetime import datetime
+from datetime import timezone
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "config.json")
+
+Config = Dict[str, Any]
+Meta = Dict[str, Any]
+# (field_name, filename, content_type, data) for one multipart file part.
+MultipartFile = Tuple[Optional[str], str, str, bytes]
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+DEFAULT_CONFIG: Config = {
+    "host": "0.0.0.0",          # bind on all interfaces; see README for locking down
+    "port": 47921,             # non-standard port (not 80/8080/21/etc.)
+    "upload_root": "uploads",   # relative to this file, or absolute
+    "max_upload_bytes": 1073741824,  # 1 GiB hard cap per request
+    "api_token": "",  # single shared bearer token; auto-generated on first run
+}
+
+
+def load_config() -> Config:
+    """Load ``config.json``, creating it with a fresh API token on first run.
+
+    Missing keys are filled in from :data:`DEFAULT_CONFIG`.
+    """
+    if not os.path.exists(CONFIG_PATH):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg["api_token"] = secrets.token_urlsafe(32)
+        with open(CONFIG_PATH, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        print("=" * 70)
+        print("No config.json found -> created one with a fresh API token.")
+        print("Shared bearer token (give it only to trusted clients, keep it secret):")
+        print(f"  {cfg['api_token']}")
+        print("Change it in config.json, or run: python3 manage_token.py rotate")
+        print("=" * 70)
+        return cfg
+
+    with open(CONFIG_PATH) as fh:
+        cfg = json.load(fh)
+    for key, val in DEFAULT_CONFIG.items():
+        cfg.setdefault(key, val)
+    return cfg
+
+
+# Runtime state, populated by configure(). Declared here so the handler's
+# global lookups always resolve; main() (and tests) call configure() to set them.
+CONFIG: Optional[Config] = None
+UPLOAD_ROOT: str = ""
+LOG_DIR: str = ""
+ACCESS_LOG: str = ""
+API_TOKEN: str = ""                    # single shared bearer token
+MAX_BYTES: int = int(DEFAULT_CONFIG["max_upload_bytes"])
+
+
+def configure(cfg: Config) -> Config:
+    """Apply a config dict to module state and create the log directory.
+
+    Args:
+        cfg: Configuration with the same keys as :data:`DEFAULT_CONFIG`.
+
+    Returns:
+        The same ``cfg``, for convenience.
+    """
+    global CONFIG, UPLOAD_ROOT, LOG_DIR, ACCESS_LOG, API_TOKEN, MAX_BYTES
+    CONFIG = cfg
+    root = cfg["upload_root"]
+    if not os.path.isabs(root):
+        root = os.path.join(HERE, root)
+    UPLOAD_ROOT = root
+    LOG_DIR = os.path.join(UPLOAD_ROOT, "_logs")
+    ACCESS_LOG = os.path.join(LOG_DIR, "access.log")
+    API_TOKEN = cfg.get("api_token", "")
+    MAX_BYTES = int(cfg["max_upload_bytes"])
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return cfg
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def now() -> datetime:
+    """Return the current time as a timezone-aware datetime in local time."""
+    return datetime.now(timezone.utc).astimezone()
+
+
+def safe_filename(name: Optional[str]) -> str:
+    """Make ``name`` safe to use as a single path component.
+
+    Strips any directory part, replaces unusual characters with ``_`` and caps
+    the length at 200 characters, so path traversal is impossible. Falls back
+    to ``"file"`` if nothing usable is left.
+    """
+    name = (name or "").replace("\\", "/").split("/")[-1]
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip().strip(".")
+    return (name or "file")[:200]
+
+
+def detect_os(user_agent: Optional[str]) -> str:
+    """Best-effort guess of the client OS from its User-Agent string.
+
+    Returns one of ``Windows``, ``Android``, ``iOS``, ``macOS``, ``Linux`` or
+    ``Unknown``.
+    """
+    u = (user_agent or "").lower()
+    if "windows" in u:
+        return "Windows"
+    if "android" in u:
+        return "Android"
+    if "iphone" in u or "ipad" in u or " ios" in u:
+        return "iOS"
+    if "mac os" in u or "macintosh" in u or "darwin" in u:
+        return "macOS"
+    if "linux" in u:
+        return "Linux"
+    return "Unknown"
+
+
+def parse_multipart(body: bytes, boundary: bytes) -> List[MultipartFile]:
+    """Extract the file parts from a ``multipart/form-data`` body.
+
+    Args:
+        body: The raw request body.
+        boundary: The multipart boundary (without the leading ``--``).
+
+    Returns:
+        A list of ``(field_name, filename, content_type, data)`` tuples. Plain
+        form fields (parts without a ``filename``) are skipped.
+    """
+    results: List[MultipartFile] = []
+    delim = b"--" + boundary
+    for part in body.split(delim):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if b"\r\n\r\n" not in part:
+            continue
+        raw_headers, data = part.split(b"\r\n\r\n", 1)
+        headers: Dict[bytes, bytes] = {}
+        for line in raw_headers.split(b"\r\n"):
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower()] = v.strip()
+        disp = headers.get(b"content-disposition", b"").decode("utf-8", "replace")
+        name: Optional[str] = None
+        filename: Optional[str] = None
+        for tok in disp.split(";"):
+            tok = tok.strip()
+            if tok.startswith("name="):
+                name = tok[5:].strip('"')
+            elif tok.startswith("filename="):
+                filename = tok[9:].strip('"')
+        ctype = headers.get(b"content-type", b"application/octet-stream").decode(
+            "utf-8", "replace"
+        )
+        if filename is not None:
+            results.append((name, filename, ctype, data))
+    return results
+
+
+# --------------------------------------------------------------------------
+# Request handler
+# --------------------------------------------------------------------------
+
+
+class DropHandler(BaseHTTPRequestHandler):
+    """HTTP handler that accepts authenticated POST uploads and nothing else."""
+
+    server_version = "FileDrop/1.0"
+    protocol_version = "HTTP/1.1"
+
+    # ---- response helpers ------------------------------------------------
+
+    def send_json(
+        self,
+        code: int,
+        payload: Dict[str, Any],
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Send ``payload`` as a JSON response with status ``code``."""
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        # Error paths return without consuming the request body; with keep-alive
+        # those unread bytes would corrupt the next request on this socket, so
+        # close the connection after any error response.
+        if code >= 400:
+            self.close_connection = True
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if code >= 400:
+            self.send_header("Connection", "close")
+        for key, val in (extra_headers or {}).items():
+            self.send_header(key, val)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def reject_method(self) -> None:
+        """Answer any non-POST method with a bland 404.
+
+        Discloses nothing about which methods are accepted: no 405 and no
+        Allow header, so a GET looks identical to hitting a dead path.
+        """
+        self.send_json(404, {"error": "not found"})
+
+    # Only POST is served; every other method is a generic 404.
+    do_GET = reject_method
+    do_HEAD = reject_method
+    do_PUT = reject_method
+    do_DELETE = reject_method
+    do_PATCH = reject_method
+    do_OPTIONS = reject_method
+
+    # ---- auth ------------------------------------------------------------
+
+    def authenticate(self) -> bool:
+        """Check the request for the shared token.
+
+        Accepts ``Authorization: Bearer <token>`` or ``X-API-Key: <token>``.
+
+        Returns:
+            True if the token matches. Otherwise an error response (401, 403
+            or 503) has already been sent and False is returned.
+        """
+        if not API_TOKEN:
+            self.access_log("NO-TOKEN-CONFIGURED", "-", 503)
+            self.send_json(503, {"error": "server has no api_token configured"})
+            return False
+
+        auth = self.headers.get("Authorization", "")
+        token = ""
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+        if not token:
+            token = self.headers.get("X-API-Key", "").strip()
+
+        if not token:
+            self.access_log("AUTH-MISSING", "-", 401)
+            self.send_json(
+                401,
+                {"error": "missing credentials",
+                 "hint": "send 'Authorization: Bearer <token>' or 'X-API-Key: <token>'"},
+                {"WWW-Authenticate": 'Bearer realm="file-drop"'},
+            )
+            return False
+
+        if hmac.compare_digest(token, API_TOKEN):
+            return True
+
+        self.access_log("AUTH-BAD", "-", 403)
+        self.send_json(403, {"error": "invalid credentials"})
+        return False
+
+    def client_id(self) -> str:
+        """Return who sent this: the declared X-Client-Id/Name, else ``ip-<addr>``."""
+        cid = self.headers.get("X-Client-Id") or self.headers.get("X-Client-Name") or ""
+        cid = safe_filename(cid) if cid.strip() else ""
+        if not cid:
+            cid = "ip-" + self.client_address[0].replace(":", "_")
+        return cid
+
+    # ---- the one allowed method -----------------------------------------
+
+    def do_POST(self) -> None:
+        """Handle an upload: authenticate, read the body, store every file."""
+        if not self.authenticate():
+            return
+        client = self.client_id()
+
+        path = self.path.split("?", 1)[0]
+        if path not in ("/", "/upload"):
+            self.send_json(404, {"error": "not found", "hint": "POST files to /upload"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self.send_json(400, {"error": "empty body / missing Content-Length"})
+            return
+        if length > MAX_BYTES:
+            self.send_json(413, {"error": "payload too large", "max_bytes": MAX_BYTES})
+            return
+
+        body = self._read_exactly(length)
+        if body is None:
+            self.send_json(400, {"error": "could not read full body"})
+            return
+
+        files = self._extract_files(body)
+        if files is None:
+            self.send_json(400, {"error": "multipart boundary missing"})
+            return
+        if not files:
+            self.send_json(400, {"error": "no file found in request"})
+            return
+
+        stored = [self._store_one(client, fn, ct, data) for fn, ct, data in files]
+        names = ", ".join(s["original_filename"] for s in stored)
+        total = sum(s["size"] for s in stored)
+        self.access_log(
+            "UPLOAD", client, 201,
+            extra=f"{len(stored)} file(s), {total} bytes: {names}",
+        )
+        self.send_json(201, {"status": "stored", "client": client, "files": stored})
+
+    def _extract_files(self, body: bytes) -> Optional[List[Tuple[str, str, bytes]]]:
+        """Split the request body into ``(filename, content_type, data)`` triples.
+
+        Multipart bodies may hold several files. Any other body is treated as
+        one raw file, named by ``X-Filename`` or ``Content-Disposition``.
+
+        Returns:
+            The files found, or None if a multipart body has no boundary.
+        """
+        ctype = self.headers.get("Content-Type", "")
+
+        if ctype.startswith("multipart/form-data"):
+            m = re.search(r"boundary=([^;]+)", ctype)
+            if not m:
+                return None
+            boundary = m.group(1).strip().strip('"').encode("utf-8")
+            return [
+                (filename, part_ctype, data)
+                for _name, filename, part_ctype, data in parse_multipart(body, boundary)
+            ]
+
+        filename = self.headers.get("X-Filename", "")
+        if not filename:
+            disp = self.headers.get("Content-Disposition", "")
+            m = re.search(r'filename="?([^";]+)"?', disp)
+            filename = m.group(1) if m else "upload.bin"
+        return [(filename, ctype or "application/octet-stream", body)]
+
+    # ---- storage ---------------------------------------------------------
+
+    def _store_one(
+        self, client: str, raw_filename: str, content_type: str, data: bytes
+    ) -> Meta:
+        """Write one file plus its metadata under ``uploads/<client>/``.
+
+        The stored name is timestamp-prefixed so uploads never overwrite each
+        other. Metadata goes to a ``.meta.json`` sidecar and is appended to the
+        client's ``_uploads.jsonl`` log.
+
+        Returns:
+            The metadata record for the stored file.
+        """
+        ts = now()
+        client_dir = os.path.join(UPLOAD_ROOT, safe_filename(client))
+        os.makedirs(client_dir, exist_ok=True)
+
+        orig = safe_filename(raw_filename)
+        stored_name = f"{ts.strftime('%Y%m%d-%H%M%S-%f')}__{orig}"
+        dest = os.path.join(client_dir, stored_name)
+        with open(dest, "wb") as fh:
+            fh.write(data)
+
+        ip, src_port = self.client_address[0], self.client_address[1]
+        user_agent = self.headers.get("User-Agent", "")
+        meta: Meta = {
+            "client": client,
+            "stored_name": stored_name,
+            "original_filename": orig,
+            "size": len(data),
+            "content_type": content_type,
+            "received_at": ts.isoformat(),
+            "date": ts.strftime("%Y-%m-%d"),
+            "time": ts.strftime("%H:%M:%S %Z"),
+            "source_ip": ip,
+            "source_port": src_port,
+            "os": detect_os(user_agent),
+            "user_agent": user_agent,
+            "hostname_claimed": self.headers.get("X-Client-Host", ""),
+        }
+
+        # Per-file sidecar.
+        with open(dest + ".meta.json", "w") as fh:
+            json.dump(meta, fh, indent=2)
+        # Per-client append-only JSONL log.
+        with open(os.path.join(client_dir, "_uploads.jsonl"), "a") as fh:
+            fh.write(json.dumps(meta) + "\n")
+
+        return meta
+
+    # ---- utilities --------------------------------------------------------
+
+    def _read_exactly(self, n: int) -> Optional[bytes]:
+        """Read exactly ``n`` bytes of request body, or None if the client hangs up early."""
+        chunks: List[bytes] = []
+        remaining = n
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def access_log(self, event: str, client: str, status: int, extra: str = "") -> None:
+        """Append one tab-separated line to the access log and echo it to stdout."""
+        line = (
+            f"{now().isoformat()}\t{event}\t{self.client_address[0]}\t"
+            f"{client}\t{self.command} {self.path}\t{status}\t{extra}\n"
+        )
+        try:
+            with open(ACCESS_LOG, "a") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Silence the default noisy stderr logging; :meth:`access_log` does ours."""
+
+
+def main() -> None:
+    """Load config and serve until Ctrl+C."""
+    cfg = configure(load_config())
+    httpd = ThreadingHTTPServer((cfg["host"], cfg["port"]), DropHandler)
+    print(f"File-drop server listening on http://{cfg['host']}:{cfg['port']}")
+    print("Upload endpoint: POST /upload   (POST only; all else -> 404)")
+    print(f"Storing files under: {UPLOAD_ROOT}")
+    print(f"Auth: shared bearer token ({'set' if API_TOKEN else 'MISSING - edit config.json'})")
+    print("Press Ctrl+C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        httpd.shutdown()
+
+
+if __name__ == "__main__":
+    main()
