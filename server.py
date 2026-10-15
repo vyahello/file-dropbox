@@ -6,10 +6,11 @@ Behavior
 --------
 - Accepts ONLY POST requests (uploads). Every other method -> generic 404 (no Allow header).
 - Requires a bearer token / API key. Missing creds -> 401, bad creds -> 403.
-- Each client lands in its own folder: uploads/<client>/.
-- Records who sent what: date, time, client, IP, OS, User-Agent, filename,
-  size, content-type -> a per-file .meta.json sidecar, a per-client JSONL log,
-  and a combined server access log.
+- Files land in uploads/<client>/<YYYY-MM-DD>/ under their original names;
+  a name clash gets a numeric suffix (report.pdf, report-1.pdf, ...).
+- Records who sent what: date, time, client, IP, User-Agent, filename, size,
+  content-type -> one line per file in uploads/<client>/uploads.jsonl, plus a
+  combined server access log.
 
 Standard library only. Python 3.8+.
 """
@@ -20,6 +21,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 from datetime import datetime
 from datetime import timezone
 from http.server import BaseHTTPRequestHandler
@@ -84,6 +86,8 @@ LOG_DIR: str = ""
 ACCESS_LOG: str = ""
 API_TOKEN: str = ""                    # single shared bearer token
 MAX_BYTES: int = int(DEFAULT_CONFIG["max_upload_bytes"])
+INDEX_NAME = "uploads.jsonl"           # per-client metadata index
+_INDEX_LOCK = threading.Lock()         # keeps concurrent JSONL appends whole
 
 
 def configure(cfg: Config) -> Config:
@@ -130,24 +134,28 @@ def safe_filename(name: Optional[str]) -> str:
     return (name or "file")[:200]
 
 
-def detect_os(user_agent: Optional[str]) -> str:
-    """Best-effort guess of the client OS from its User-Agent string.
+def create_unique(directory: str, filename: str) -> Tuple[int, str]:
+    """Atomically create a new file in ``directory``, never overwriting.
 
-    Returns one of ``Windows``, ``Android``, ``iOS``, ``macOS``, ``Linux`` or
-    ``Unknown``.
+    Tries ``filename`` first, then ``stem-1.ext``, ``stem-2.ext``, ... until
+    one doesn't exist. ``O_EXCL`` makes this safe across concurrent uploads.
+
+    Returns:
+        An open, writable file descriptor and the name actually used.
     """
-    u = (user_agent or "").lower()
-    if "windows" in u:
-        return "Windows"
-    if "android" in u:
-        return "Android"
-    if "iphone" in u or "ipad" in u or " ios" in u:
-        return "iOS"
-    if "mac os" in u or "macintosh" in u or "darwin" in u:
-        return "macOS"
-    if "linux" in u:
-        return "Linux"
-    return "Unknown"
+    stem, ext = os.path.splitext(filename)
+    candidate, n = filename, 0
+    while True:
+        try:
+            fd = os.open(
+                os.path.join(directory, candidate),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o644,
+            )
+            return fd, candidate
+        except FileExistsError:
+            n += 1
+            candidate = f"{stem}-{n}{ext}"
 
 
 def parse_multipart(body: bytes, boundary: bytes) -> List[MultipartFile]:
@@ -372,48 +380,40 @@ class DropHandler(BaseHTTPRequestHandler):
     def _store_one(
         self, client: str, raw_filename: str, content_type: str, data: bytes
     ) -> Meta:
-        """Write one file plus its metadata under ``uploads/<client>/``.
+        """Write one file to ``uploads/<client>/<YYYY-MM-DD>/`` and index it.
 
-        The stored name is timestamp-prefixed so uploads never overwrite each
-        other. Metadata goes to a ``.meta.json`` sidecar and is appended to the
-        client's ``_uploads.jsonl`` log.
+        The file keeps its original (sanitized) name; a clash with an earlier
+        upload that day gets a numeric suffix instead of overwriting it. The
+        metadata record is appended to ``uploads/<client>/uploads.jsonl``.
 
         Returns:
             The metadata record for the stored file.
         """
         ts = now()
         client_dir = os.path.join(UPLOAD_ROOT, safe_filename(client))
-        os.makedirs(client_dir, exist_ok=True)
+        day = ts.strftime("%Y-%m-%d")
+        day_dir = os.path.join(client_dir, day)
+        os.makedirs(day_dir, exist_ok=True)
 
         orig = safe_filename(raw_filename)
-        stored_name = f"{ts.strftime('%Y%m%d-%H%M%S-%f')}__{orig}"
-        dest = os.path.join(client_dir, stored_name)
-        with open(dest, "wb") as fh:
+        fd, stored_name = create_unique(day_dir, orig)
+        with os.fdopen(fd, "wb") as fh:
             fh.write(data)
 
-        ip, src_port = self.client_address[0], self.client_address[1]
-        user_agent = self.headers.get("User-Agent", "")
         meta: Meta = {
             "client": client,
-            "stored_name": stored_name,
+            "path": f"{day}/{stored_name}",
             "original_filename": orig,
             "size": len(data),
             "content_type": content_type,
             "received_at": ts.isoformat(),
-            "date": ts.strftime("%Y-%m-%d"),
-            "time": ts.strftime("%H:%M:%S %Z"),
-            "source_ip": ip,
-            "source_port": src_port,
-            "os": detect_os(user_agent),
-            "user_agent": user_agent,
+            "source_ip": self.client_address[0],
+            "source_port": self.client_address[1],
+            "user_agent": self.headers.get("User-Agent", ""),
             "hostname_claimed": self.headers.get("X-Client-Host", ""),
         }
 
-        # Per-file sidecar.
-        with open(dest + ".meta.json", "w") as fh:
-            json.dump(meta, fh, indent=2)
-        # Per-client append-only JSONL log.
-        with open(os.path.join(client_dir, "_uploads.jsonl"), "a") as fh:
+        with _INDEX_LOCK, open(os.path.join(client_dir, INDEX_NAME), "a") as fh:
             fh.write(json.dumps(meta) + "\n")
 
         return meta

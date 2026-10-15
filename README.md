@@ -19,8 +19,8 @@ goes in the pile.
 - 🔑 **One shared token.** No token → `401`, wrong token → `403`.
 - 🗂️ **A folder per client.** Named after `X-Client-Id`, or the sender's IP if
   they didn't introduce themselves.
-- 📝 **Records everything.** Date, time, IP, OS, User-Agent, filename, size,
-  content type.
+- 📝 **Records everything.** Time, IP, User-Agent, filename, size and content
+  type, all in one JSONL index per client.
 - 🛡️ **Path traversal won't work.** `../../etc/passwd` gets saved as a file
   called `passwd`.
 - 🪶 **Standard library only.** Python 3.8+, nothing to `pip install`.
@@ -65,7 +65,7 @@ curl -X POST http://SERVER_IP:47921/upload \
 }
 ```
 
-🎉 It's saved in `uploads/alice-laptop/`.
+🎉 It's saved as `uploads/alice-laptop/<today>/cat.jpg`.
 
 ---
 
@@ -125,9 +125,6 @@ print(urllib.request.urlopen(req).read().decode())
 | `X-Client-Host` | Records your hostname in the metadata.                  |
 | `X-Filename`    | Filename for raw-body uploads. Defaults to `upload.bin`. |
 
-The OS is guessed from `User-Agent`. Browsers report it; `curl` doesn't, so it
-shows up as `Unknown`.
-
 ### What the server can answer
 
 | Code  | Meaning                                       |
@@ -178,33 +175,45 @@ Restart the server after changing the token.
 
 ## 🗄️ What gets stored
 
+One folder per client, one subfolder per day, and the files keep their real
+names:
+
 ```
 uploads/
 ├── _logs/
-│   └── access.log                               # every request: time, event, IP, client, status
+│   └── access.log              # every request: time, event, IP, client, status
 └── alice-laptop/
-    ├── 20261010-153001-123456__report.pdf       # the file, timestamp-prefixed so nothing gets overwritten
-    ├── 20261010-153001-123456__report.pdf.meta.json
-    └── _uploads.jsonl                           # one metadata line per upload
+    ├── uploads.jsonl           # the index: one metadata line per file
+    ├── 2026-10-14/
+    │   └── report.pdf
+    └── 2026-10-15/
+        ├── LICENSE.txt
+        ├── LICENSE-1.txt       # same name sent twice? it gets a suffix, nothing is overwritten
+        └── cat.jpg
 ```
 
-Each `.meta.json` file (and each line in `_uploads.jsonl`) looks like this:
+Each line in `uploads.jsonl` describes one file. `path` is relative to the
+client folder:
 
 ```json
 {
   "client": "alice-laptop",
-  "stored_name": "20261010-153001-123456__report.pdf",
-  "original_filename": "report.pdf",
-  "size": 20481,
-  "content_type": "application/pdf",
-  "received_at": "2026-10-10T15:30:01+00:00",
-  "date": "2026-10-10",
-  "time": "15:30:01 UTC",
+  "path": "2026-10-15/LICENSE-1.txt",
+  "original_filename": "LICENSE.txt",
+  "size": 1071,
+  "content_type": "text/plain",
+  "received_at": "2026-10-15T16:30:03.424931+03:00",
   "source_ip": "192.168.1.42",
   "source_port": 51514,
-  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+  "user_agent": "curl/8.5.0",
   "hostname_claimed": "alice-pc"
 }
+```
+
+The index is easy to query. For example, everything Alice sent today:
+
+```bash
+grep "$(date +%F)" uploads/alice-laptop/uploads.jsonl
 ```
 
 ---
@@ -230,7 +239,7 @@ limits, logging and metadata.
   token travels in cleartext.
 - **Everyone shares one token.** Anyone who has it can upload under any
   `X-Client-Id`. `source_ip` comes from the real socket; `X-Client-Id`,
-  `X-Client-Host` and `os` are whatever the client says. Treat them as labels,
+  `X-Client-Host` and `user_agent` are whatever the client says. Treat them as labels,
   not proof.
 - **Bodies are held in memory** up to `max_upload_bytes`. Lower the cap on
   small machines.

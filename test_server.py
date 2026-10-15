@@ -107,17 +107,13 @@ def test_safe_filename_truncates():
     assert len(server.safe_filename("x" * 500)) == 200
 
 
-@pytest.mark.parametrize("ua, expected", [
-    ("Mozilla/5.0 (Windows NT 10.0)", "Windows"),
-    ("... Android 13 ...", "Android"),
-    ("... (iPhone; ...)", "iOS"),
-    ("... (Macintosh; ...)", "macOS"),
-    ("Mozilla/5.0 (X11; Linux x86_64)", "Linux"),
-    ("curl/8.5.0", "Unknown"),
-    (None, "Unknown"),
-])
-def test_detect_os(ua, expected):
-    assert server.detect_os(ua) == expected
+def test_create_unique_adds_suffix_on_clash(tmp_path):
+    names = []
+    for _ in range(3):
+        fd, name = server.create_unique(str(tmp_path), "LICENSE.txt")
+        os.close(fd)
+        names.append(name)
+    assert names == ["LICENSE.txt", "LICENSE-1.txt", "LICENSE-2.txt"]
 
 
 def test_parse_multipart_extracts_file():
@@ -242,16 +238,35 @@ def test_raw_upload_stores_file_and_metadata(live):
     assert meta["client"] == "alice-laptop"
     assert meta["original_filename"] == "report.txt"
     assert meta["size"] == len(payload)
-    assert meta["os"] == "Linux"
+    assert "os" not in meta
     assert meta["hostname_claimed"] == "alice-pc"
     assert meta["source_ip"] == "127.0.0.1"
 
-    stored = os.path.join(client_dir(live, "alice-laptop"), meta["stored_name"])
-    assert os.path.isfile(stored)
+    day, name = meta["path"].split("/")
+    assert name == "report.txt"
+    assert day == meta["received_at"][:10]
+
+    stored = os.path.join(client_dir(live, "alice-laptop"), meta["path"])
     with open(stored, "rb") as fh:
         assert fh.read() == payload
-    assert os.path.isfile(stored + ".meta.json")
-    assert os.path.isfile(os.path.join(client_dir(live, "alice-laptop"), "_uploads.jsonl"))
+    # Only the file itself sits in the day folder: no sidecars.
+    assert os.listdir(os.path.dirname(stored)) == ["report.txt"]
+    with open(os.path.join(client_dir(live, "alice-laptop"), "uploads.jsonl")) as fh:
+        assert json.loads(fh.readline()) == meta
+
+
+def test_same_name_twice_is_not_overwritten(live):
+    paths = []
+    for payload in (b"first", b"second"):
+        status, body, _ = do_request(
+            live.port, "POST", body=payload,
+            headers=auth(**{"X-Client-Id": "dupes", "X-Filename": "LICENSE.txt"}),
+        )
+        assert status == 201
+        paths.append(json.loads(body)["files"][0]["path"])
+    assert [p.split("/")[1] for p in paths] == ["LICENSE.txt", "LICENSE-1.txt"]
+    with open(os.path.join(client_dir(live, "dupes"), paths[0]), "rb") as fh:
+        assert fh.read() == b"first"
 
 
 def test_multipart_upload_preserves_binary(live):
@@ -273,22 +288,9 @@ def test_multipart_upload_preserves_binary(live):
     meta = json.loads(resp)["files"][0]
     assert meta["original_filename"] == "photo.bin"
     assert meta["size"] == len(blob)
-    stored = os.path.join(client_dir(live, "bob-desktop"), meta["stored_name"])
+    stored = os.path.join(client_dir(live, "bob-desktop"), meta["path"])
     with open(stored, "rb") as fh:
         assert fh.read() == blob
-
-
-def test_os_autodetected_from_user_agent(live):
-    status, body, _ = do_request(
-        live.port, "POST", body=b"x",
-        headers=auth(**{
-            "X-Client-Id": "sniff-client",
-            "X-Filename": "f.txt",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        }),
-    )
-    assert status == 201
-    assert json.loads(body)["files"][0]["os"] == "Windows"
 
 
 def test_missing_client_id_falls_back_to_ip(live):
@@ -319,8 +321,8 @@ def test_filename_traversal_is_contained(live):
     assert status == 201
     meta = json.loads(body)["files"][0]
     assert meta["original_filename"] == "passwd"
-    assert ".." not in meta["stored_name"]
-    stored = os.path.realpath(os.path.join(client_dir(live, "trav"), meta["stored_name"]))
+    assert ".." not in meta["path"]
+    stored = os.path.realpath(os.path.join(client_dir(live, "trav"), meta["path"]))
     assert stored.startswith(os.path.realpath(client_dir(live, "trav")) + os.sep)
 
 
