@@ -122,19 +122,31 @@ def load_config(path: Optional[str] = None) -> Config:
             f"  {cfg['api_token']}",
         ]
     if cfg["admin_path"] and not (cfg["admin_username"] and cfg["admin_password_hash"]):
-        if not cfg["admin_username"]:
+        added_username = not cfg["admin_username"]
+        if added_username:
             cfg["admin_username"] = new_username()
+        username_line = f"  username: {cfg['admin_username']}"
+        if added_username and cfg["admin_password_hash"]:
+            username_line += "   (new: sign-in now asks for a username too)"
         if cfg["admin_password_hash"]:
-            password_line = "  password: unchanged"
+            # Upgrade from a version without usernames. The password stays, but
+            # only its hash is stored, so say that instead of printing nothing useful.
+            password_lines = [
+                "  password: the same admin password as before",
+                "            (only its hash is stored, so it can't be shown here)",
+                "Forgot the password? Set a new one with: file-dropbox admin",
+            ]
         else:
             password = new_password()
             cfg["admin_password_hash"] = hash_password(password)
-            password_line = f"  password: {password}   (shown only this once)"
+            password_lines = [
+                f"  password: {password}   (shown only this once)",
+                "Change them any time with: file-dropbox admin",
+            ]
         notes += [
             f"Admin sign-in for the web UI at {cfg['admin_path']}:",
-            f"  username: {cfg['admin_username']}",
-            password_line,
-            "Change them any time with: file-dropbox admin",
+            username_line,
+            *password_lines,
         ]
     if notes:
         save_config(cfg, path)

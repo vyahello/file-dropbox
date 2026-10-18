@@ -56,6 +56,7 @@ def test_first_run_creates_private_config_with_secrets(config_file, capsys):
     username = re.search(r"username: (\S+)", out).group(1)
     password = re.search(r"password: (\S+)\s+\(shown only this once\)", out).group(1)
     assert username == saved["admin_username"] and username.startswith("owner-")
+    assert "asks for a username too" not in out  # that note is only for upgrades
     assert password not in json.dumps(saved)
     assert verify_password(password, saved["admin_password_hash"])
 
@@ -81,7 +82,10 @@ def test_upgrade_keeps_the_password_and_adds_a_username(config_file, capsys):
     assert saved["admin_password_hash"] == "pbkdf2_sha256$1$YQ==$YQ=="
     out = capsys.readouterr().out
     assert f"username: {saved['admin_username']}" in out
-    assert "password: unchanged" in out
+    assert "sign-in now asks for a username too" in out
+    assert "password: the same admin password as before" in out
+    assert "can't be shown" in out
+    assert "Set a new one with: file-dropbox admin" in out
 
 
 def test_no_admin_password_when_admin_page_is_off(config_file):
