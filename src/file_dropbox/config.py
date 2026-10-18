@@ -28,6 +28,7 @@ DEFAULT_CONFIG: Config = {
     "max_upload_bytes": 1073741824,  # 1 GiB hard cap per request
     "api_token": "",            # single shared bearer token; generated on first run
     "admin_path": "/admin",     # owner's web UI; "" turns it off
+    "admin_username": "",       # generated on first run; kept in plain text
     "admin_password_hash": "",  # PBKDF2 hash; generated on first run
     "session_minutes": 30,      # admin is signed out after this much idle time
     "secure_cookies": False,    # set true when served over HTTPS (reverse proxy)
@@ -53,6 +54,11 @@ def new_token() -> str:
 def new_password() -> str:
     """A fresh random admin password."""
     return secrets.token_urlsafe(18)
+
+
+def new_username() -> str:
+    """A fresh admin username that isn't the guessable ``admin``."""
+    return f"owner-{secrets.token_hex(3)}"
 
 
 def read_config(path: Optional[str] = None) -> Config:
@@ -92,9 +98,11 @@ def load_config(path: Optional[str] = None) -> Config:
     """Load the config for the server, creating or completing it as needed.
 
     On first run this creates the file with a fresh upload token. Whenever the
-    admin UI is on but has no password yet (first run, or an upgrade from an
-    older version), it generates one, stores only its hash and prints the
-    password once. Missing keys are filled in from :data:`DEFAULT_CONFIG`.
+    admin UI is on but has no username or password yet (first run, or an
+    upgrade from an older version), it generates what's missing and prints it.
+    The password is shown only once, since only its hash is stored; the
+    username stays readable in the file. Missing keys are filled in from
+    :data:`DEFAULT_CONFIG`.
     """
     path = path or config_path()
     created = not os.path.exists(path)
@@ -113,13 +121,20 @@ def load_config(path: Optional[str] = None) -> Config:
             "Upload token (give it only to trusted clients, keep it secret):",
             f"  {cfg['api_token']}",
         ]
-    if cfg["admin_path"] and not cfg["admin_password_hash"]:
-        password = new_password()
-        cfg["admin_password_hash"] = hash_password(password)
+    if cfg["admin_path"] and not (cfg["admin_username"] and cfg["admin_password_hash"]):
+        if not cfg["admin_username"]:
+            cfg["admin_username"] = new_username()
+        if cfg["admin_password_hash"]:
+            password_line = "  password: unchanged"
+        else:
+            password = new_password()
+            cfg["admin_password_hash"] = hash_password(password)
+            password_line = f"  password: {password}   (shown only this once)"
         notes += [
-            f"Admin password for the web UI at {cfg['admin_path']} (shown only this once):",
-            f"  {password}",
-            "Change it any time with: file-dropbox admin-password",
+            f"Admin sign-in for the web UI at {cfg['admin_path']}:",
+            f"  username: {cfg['admin_username']}",
+            password_line,
+            "Change them any time with: file-dropbox admin",
         ]
     if notes:
         save_config(cfg, path)

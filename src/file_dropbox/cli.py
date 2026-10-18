@@ -6,13 +6,14 @@ Usage:
   file-dropbox token show         print the current upload token
   file-dropbox token rotate       new random upload token (old one stops working)
   file-dropbox token set TOKEN    set a specific upload token
-  file-dropbox admin-password     set or generate the admin password
+  file-dropbox admin              set the admin username and password
 
 Restart the server after changing a secret.
 """
 
 import argparse
 import getpass
+import re
 import sys
 from typing import List
 from typing import Optional
@@ -28,6 +29,7 @@ from file_dropbox.security import hash_password
 from file_dropbox.server import serve
 
 MIN_PASSWORD_LENGTH = 12
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{3,64}$")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,7 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     set_token = actions.add_parser("set", help="set a specific token")
     set_token.add_argument("value", metavar="TOKEN")
 
-    commands.add_parser("admin-password", help="set or generate the admin password")
+    # "admin-password" is the name older versions used.
+    commands.add_parser("admin", aliases=["admin-password"], help="set the admin username and password")
     return parser
 
 
@@ -66,6 +69,19 @@ def token_command(action: str, value: Optional[str] = None) -> None:
         print(f"  {cfg['api_token']}")
     else:
         print("Upload token set. Restart the server.")
+
+
+def ask_admin_username(current: str) -> str:
+    """Prompt for the admin username; an empty answer keeps ``current``.
+
+    Raises:
+        ConfigError: if the username isn't 3-64 letters, digits or ``. _ @ -``.
+    """
+    prompt = f"Admin username [{current}]: " if current else "Admin username: "
+    username = input(prompt).strip() or current
+    if not USERNAME_RE.match(username):
+        raise ConfigError("Use 3 to 64 letters, digits or . _ @ - for the username. Nothing was changed.")
+    return username
 
 
 def ask_admin_password() -> str:
@@ -87,12 +103,14 @@ def ask_admin_password() -> str:
     return password
 
 
-def admin_password_command() -> None:
-    """Store a new admin password hash in config.json."""
+def admin_command() -> None:
+    """Store a new admin username and password hash in config.json."""
     cfg = read_config()
+    username = ask_admin_username(cfg.get("admin_username", ""))
     cfg["admin_password_hash"] = hash_password(ask_admin_password())
+    cfg["admin_username"] = username
     save_config(cfg)
-    print("Admin password updated. Restart the server to use it.")
+    print(f"Admin sign-in updated for {username}. Restart the server to use it.")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -107,8 +125,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             serve(load_config())
         elif args.command == "token":
             token_command(args.action, getattr(args, "value", None))
-        elif args.command == "admin-password":
-            admin_password_command()
+        elif args.command in ("admin", "admin-password"):
+            admin_command()
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 1

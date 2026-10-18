@@ -1,5 +1,5 @@
 /*
- * file-dropbox admin UI.
+ * Admin UI.
  * Airmail stationery: cool envelope paper, navy ink, and the red/blue airmail
  * stripe as the one decorative element. No web fonts, no scripts.
  */
@@ -231,6 +231,7 @@ code {
   cursor: not-allowed;
 }
 
+input[type="text"],
 input[type="password"],
 input[type="search"] {
   width: 100%;
@@ -287,24 +288,18 @@ label {
   margin-bottom: 16px;
 }
 
-.letter .lede {
-  font-size: 1rem;
-}
-
 .stack {
   display: grid;
   gap: 8px;
   margin-top: 24px;
 }
 
-.stack .btn {
-  margin-top: 8px;
+.stack input + label {
+  margin-top: 10px;
 }
 
-.hint {
-  margin: 20px 0 0;
-  color: var(--ink-soft);
-  font-size: 0.875rem;
+.stack .btn {
+  margin-top: 8px;
 }
 
 @media (min-width: 480px) {

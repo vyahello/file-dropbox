@@ -84,6 +84,7 @@ def configure(cfg: Config) -> Config:
     )
     admin.configure(
         path=setting("admin_path"),
+        username=setting("admin_username"),
         password_hash=setting("admin_password_hash"),
         upload_root=UPLOAD_ROOT,
         access_log=ACCESS_LOG,

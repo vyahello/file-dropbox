@@ -17,8 +17,9 @@ Security notes
 - Sessions live in an HttpOnly, SameSite=Strict cookie with an idle timeout.
 - POSTs from another origin are refused; signing out also needs the
   session's CSRF token.
-- Wrong passwords count towards the same per-address lockout as wrong
-  upload tokens.
+- Wrong usernames or passwords count towards the same per-address lockout
+  as wrong upload tokens. The error never says which of the two was wrong.
+- The sign-in page itself names nothing: no product, no hints.
 
 Standard library only.
 """
@@ -100,11 +101,11 @@ EVENTS = {
 
 # Runtime state, set by configure(). An empty PREFIX means the UI is off.
 PREFIX = ""
+USERNAME = ""
 PASSWORD_HASH = ""
 UPLOAD_ROOT = ""
 ACCESS_LOG = ""
 SECURE_COOKIES = False
-LOCKOUT_MINUTES = 15
 LIMITER = LoginLimiter()
 SESSIONS = SessionStore()
 
@@ -112,6 +113,7 @@ SESSIONS = SessionStore()
 def configure(
     *,
     path: str,
+    username: str,
     password_hash: str,
     upload_root: str,
     access_log: str,
@@ -123,24 +125,26 @@ def configure(
 
     Args:
         path: URL prefix such as ``/admin``. Empty turns the UI off.
-        password_hash: Hash from :func:`security.hash_password`. Empty turns
-            the UI off too, so it can never be opened without a password.
+        username: The admin's username.
+        password_hash: Hash from :func:`security.hash_password`. An empty
+            username or hash turns the UI off too, so it can never be opened
+            without both.
         upload_root: Folder holding one sub-folder per client.
         access_log: The server's access log, shown as recent activity.
         session_minutes: Idle time after which the admin is signed out.
         secure_cookies: Mark the cookie ``Secure`` (only when served via HTTPS).
         limiter: Shared brute-force limiter, also used for upload tokens.
     """
-    global PREFIX, PASSWORD_HASH, UPLOAD_ROOT, ACCESS_LOG, SECURE_COOKIES
-    global LOCKOUT_MINUTES, LIMITER, SESSIONS
+    global PREFIX, USERNAME, PASSWORD_HASH, UPLOAD_ROOT, ACCESS_LOG, SECURE_COOKIES
+    global LIMITER, SESSIONS
     prefix = path.strip().strip("/")
-    PREFIX = "/" + prefix if prefix and password_hash else ""
+    PREFIX = "/" + prefix if prefix and username and password_hash else ""
+    USERNAME = username
     PASSWORD_HASH = password_hash
     UPLOAD_ROOT = upload_root
     ACCESS_LOG = access_log
     SECURE_COOKIES = secure_cookies
     LIMITER = limiter
-    LOCKOUT_MINUTES = max(1, round(limiter.lockout_seconds / 60))
     SESSIONS = SessionStore(idle_seconds=session_minutes * 60)
 
 
@@ -253,7 +257,7 @@ def layout(title: str, main: str, session: Optional[Session] = None) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>{h(title)} | file-dropbox</title>
+<title>{h(title)}{" | file-dropbox" if session else ""}</title>
 <link rel="icon" href="{url('static', 'icon.svg')}" type="image/svg+xml">
 <link rel="stylesheet" href="{url('static', 'admin.css')}">
 </head>
@@ -265,13 +269,17 @@ def layout(title: str, main: str, session: Optional[Session] = None) -> str:
 
 
 def render_login(error: str = "", locked_seconds: int = 0) -> str:
-    """The sign-in page, optionally with an error or a lockout notice."""
+    """The sign-in page, optionally with an error or a lockout notice.
+
+    Anyone can open this page, so it says nothing about what it protects:
+    no product name, no hints, no recovery instructions.
+    """
     message = ""
     if locked_seconds:
         minutes = max(1, -(-locked_seconds // 60))
         message = (
-            f'<p class="alert" role="alert">Too many wrong passwords from your network '
-            f'address. Sign-in is blocked for {count(minutes, "more minute")}.</p>'
+            f'<p class="alert" role="alert">Too many attempts. '
+            f'Try again in {count(minutes, "minute")}.</p>'
         )
     elif error:
         message = f'<p class="alert" role="alert">{h(error)}</p>'
@@ -282,14 +290,14 @@ def render_login(error: str = "", locked_seconds: int = 0) -> str:
     <div class="letter">
       <img class="letter-icon" src="{url('static', 'icon.svg')}" alt="" width="48" height="48">
       <h1>Sign in</h1>
-      <p class="lede">This page is for the server owner. Use the admin password the server printed when it first started.</p>
       {message}
       <form method="post" action="{url('login')}" class="stack">
-        <label for="password">Admin password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus{disabled}>
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus{disabled}>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required{disabled}>
         <button class="btn btn-primary" type="submit"{disabled}>Sign in</button>
       </form>
-      <p class="hint">Lost it? On the server, run <code>file-dropbox admin-password</code> and restart.</p>
     </div>
   </div>
 </main>""")
@@ -477,7 +485,7 @@ def render_file(session: Session, client: str, rel: str, path: str, meta: Dict[s
 
 def render_message(session: Optional[Session], title: str, text: str) -> str:
     """A plain page with a heading, a sentence and a way back."""
-    back = f'<p><a href="{url()}">Back to the mailbox</a></p>' if session else f'<p><a href="{url("login")}">Go to sign-in</a></p>'
+    back = f'<p><a href="{url()}">Back to the mailbox</a></p>' if session else ""
     return layout(title, f"""
 <main class="wrap">
   <h1>{h(title)}</h1>
@@ -586,7 +594,7 @@ class AdminRoutes(BaseHTTPRequestHandler):
     # ---- sign in / out -----------------------------------------------------
 
     def _login(self) -> None:
-        """Check the password, with per-address lockout after repeated failures."""
+        """Check username and password, with per-address lockout after repeated failures."""
         key = client_key(self.client_address[0])
         wait = LIMITER.retry_after(key)
         if wait:
@@ -599,7 +607,11 @@ class AdminRoutes(BaseHTTPRequestHandler):
             self._send_page(400, render_login(error="That sign-in request was malformed. Try again."))
             return
 
-        if verify_password(form.get("password", ""), PASSWORD_HASH):
+        # Always run the (slow) password check, so a wrong username takes as long
+        # as a wrong password and the timing can't confirm a username.
+        username_ok = hmac.compare_digest(form.get("username", "").encode(), USERNAME.encode())
+        password_ok = verify_password(form.get("password", ""), PASSWORD_HASH)
+        if username_ok and password_ok:
             LIMITER.record_success(key)
             session = SESSIONS.create()
             self.access_log("ADMIN-LOGIN", "-", 303)
@@ -613,10 +625,7 @@ class AdminRoutes(BaseHTTPRequestHandler):
             self._send_page(429, render_login(locked_seconds=wait), {"Retry-After": str(wait)})
             return
         self.access_log("ADMIN-LOGIN-FAIL", "-", 401, extra=f"{left} tries left")
-        tries = "1 try" if left == 1 else f"{left} tries"
-        self._send_page(401, render_login(
-            error=f"That password is wrong. {tries} left, then sign-in is blocked for {LOCKOUT_MINUTES} minutes.",
-        ))
+        self._send_page(401, render_login(error="Wrong username or password."))
 
     def _logout(self) -> None:
         """End the session if the form carries its CSRF token."""

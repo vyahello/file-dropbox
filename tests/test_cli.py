@@ -8,6 +8,7 @@ Run:  pytest -v
 
 import json
 import os
+import re
 import stat
 from typing import Iterator
 
@@ -50,10 +51,13 @@ def test_first_run_creates_private_config_with_secrets(config_file, capsys):
     out = capsys.readouterr().out
     assert cfg["api_token"] in out
 
-    # The admin password is printed once, and only its hash is stored.
-    password = out.split("shown only this once):\n")[1].split("\n")[0].strip()
-    assert password not in json.dumps(read(config_file))
-    assert verify_password(password, read(config_file)["admin_password_hash"])
+    # The username is printed and kept; the password is printed once and only its hash is kept.
+    saved = read(config_file)
+    username = re.search(r"username: (\S+)", out).group(1)
+    password = re.search(r"password: (\S+)\s+\(shown only this once\)", out).group(1)
+    assert username == saved["admin_username"] and username.startswith("owner-")
+    assert password not in json.dumps(saved)
+    assert verify_password(password, saved["admin_password_hash"])
 
 
 def test_upgrade_adds_admin_password_and_keeps_settings(config_file):
@@ -64,7 +68,20 @@ def test_upgrade_adds_admin_password_and_keeps_settings(config_file):
     saved = read(config_file)
     assert saved["api_token"] == "old-token" and saved["port"] == 1234
     assert saved["admin_password_hash"].startswith("pbkdf2_sha256$")
+    assert saved["admin_username"].startswith("owner-")
     assert cfg["upload_root"] == "uploads"  # defaults filled in
+
+
+def test_upgrade_keeps_the_password_and_adds_a_username(config_file, capsys):
+    os.makedirs(os.path.dirname(config_file))
+    with open(config_file, "w") as fh:
+        json.dump({"api_token": "t", "admin_password_hash": "pbkdf2_sha256$1$YQ==$YQ=="}, fh)
+    load_config()
+    saved = read(config_file)
+    assert saved["admin_password_hash"] == "pbkdf2_sha256$1$YQ==$YQ=="
+    out = capsys.readouterr().out
+    assert f"username: {saved['admin_username']}" in out
+    assert "password: unchanged" in out
 
 
 def test_no_admin_password_when_admin_page_is_off(config_file):
@@ -72,7 +89,8 @@ def test_no_admin_password_when_admin_page_is_off(config_file):
     with open(config_file, "w") as fh:
         json.dump({"api_token": "t", "admin_path": ""}, fh)
     load_config()
-    assert "admin_password_hash" not in read(config_file)  # file left untouched
+    saved = read(config_file)
+    assert "admin_password_hash" not in saved and "admin_username" not in saved  # untouched
 
 
 # --------------------------------------------------------------------------
@@ -102,34 +120,45 @@ def test_commands_explain_a_missing_config(config_file, capsys):
     assert "Start the server once" in capsys.readouterr().err
 
 
-def test_admin_password_is_hashed(config_file, monkeypatch):
+@pytest.mark.parametrize("command", ["admin", "admin-password"])  # old name still works
+def test_admin_command_sets_username_and_password(config_file, monkeypatch, command):
     load_config()
+    monkeypatch.setattr("builtins.input", lambda prompt="": "me@home")
     monkeypatch.setattr("getpass.getpass", lambda prompt="": "a-long-enough-password")
-    assert cli.main(["admin-password"]) == 0
-    assert verify_password("a-long-enough-password", read(config_file)["admin_password_hash"])
+    assert cli.main([command]) == 0
+    saved = read(config_file)
+    assert saved["admin_username"] == "me@home"
+    assert verify_password("a-long-enough-password", saved["admin_password_hash"])
 
 
-def test_admin_password_can_be_generated(config_file, monkeypatch, capsys):
+def test_admin_command_keeps_username_and_can_generate_password(config_file, monkeypatch, capsys):
     load_config()
+    username = read(config_file)["admin_username"]
     capsys.readouterr()
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
     monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
-    assert cli.main(["admin-password"]) == 0
+    assert cli.main(["admin"]) == 0
     generated = capsys.readouterr().out.split("safe):\n")[1].split("\n")[0].strip()
-    assert verify_password(generated, read(config_file)["admin_password_hash"])
+    saved = read(config_file)
+    assert saved["admin_username"] == username
+    assert verify_password(generated, saved["admin_password_hash"])
 
 
-@pytest.mark.parametrize("answers, message", [
-    (["short"], "at least 12 characters"),
-    (["a-long-enough-password", "something-else-entirely"], "don't match"),
+@pytest.mark.parametrize("username, passwords, message", [
+    ("", ["short"], "at least 12 characters"),
+    ("", ["a-long-enough-password", "something-else-entirely"], "don't match"),
+    ("x", ["a-long-enough-password"] * 2, "3 to 64"),
+    ("has space", ["a-long-enough-password"] * 2, "3 to 64"),
 ])
-def test_bad_admin_passwords_change_nothing(config_file, monkeypatch, capsys, answers, message):
+def test_bad_admin_input_changes_nothing(config_file, monkeypatch, capsys, username, passwords, message):
     load_config()
-    before = read(config_file)["admin_password_hash"]
-    replies = iter(answers)
+    before = read(config_file)
+    replies = iter(passwords)
+    monkeypatch.setattr("builtins.input", lambda prompt="": username)
     monkeypatch.setattr("getpass.getpass", lambda prompt="": next(replies))
-    assert cli.main(["admin-password"]) == 1
+    assert cli.main(["admin"]) == 1
     assert message in capsys.readouterr().err
-    assert read(config_file)["admin_password_hash"] == before
+    assert read(config_file) == before
 
 
 def test_version_flag(capsys):

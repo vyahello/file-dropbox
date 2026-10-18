@@ -25,6 +25,7 @@ from file_dropbox import server
 from file_dropbox.security import hash_password
 
 TOKEN = "upload-token-xyz"
+USERNAME = "owner-test"
 PASSWORD = "correct horse battery staple"
 NOTES = b"<script>alert(1)</script>\nsecond line\n"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -69,6 +70,7 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         "max_upload_bytes": 1073741824,
         "api_token": TOKEN,
         "admin_path": "/admin",
+        "admin_username": USERNAME,
         "admin_password_hash": hash_password(PASSWORD, iterations=1000),
     })
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.DropHandler)
@@ -88,9 +90,12 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         thread.join(timeout=5)
 
 
-def login(live: SimpleNamespace, password: str = PASSWORD, **headers: str) -> Response:
+def login(
+    live: SimpleNamespace, password: str = PASSWORD, username: str = USERNAME, **headers: str,
+) -> Response:
     """Submit the sign-in form."""
-    return request(live.port, "POST", "/admin/login", urlencode({"password": password}).encode(), {
+    form = urlencode({"username": username, "password": password}).encode()
+    return request(live.port, "POST", "/admin/login", form, {
         "Content-Type": "application/x-www-form-urlencoded", **headers,
     })
 
@@ -121,7 +126,17 @@ def test_login_page_has_strict_headers(live):
     assert "script-src" not in hdrs["content-security-policy"]  # no scripts at all
     assert hdrs["x-frame-options"] == "DENY"
     assert hdrs["cache-control"] == "no-store"
-    assert b'name="password"' in body
+    assert b'name="username"' in body and b'name="password"' in body
+
+
+def test_login_page_gives_nothing_away(live):
+    _, body, hdrs = get(live, "/admin/login")
+    assert b"<title>Sign in</title>" in body
+    for leak in (b"file-dropbox", b"admin-password", b"owner", USERNAME.encode(), b"Python"):
+        assert leak not in body
+    assert "server" not in hdrs
+    _, css, _ = get(live, "/admin/static/admin.css")
+    assert b"file-dropbox" not in css
 
 
 @pytest.mark.parametrize("path", ["/admin", "/admin/", "/admin/clients/alice", "/admin/raw/alice/x.txt"])
@@ -149,10 +164,20 @@ def test_login_sets_hardened_cookie(live):
         assert attr in cookie
 
 
-def test_wrong_password_counts_down(live):
+def test_wrong_password_gets_a_generic_error(live):
     status, body, _ = login(live, "nope")
     assert status == 401
-    assert b"4 tries left" in body
+    assert b"Wrong username or password." in body
+    assert b"tries left" not in body  # no hints about the lockout policy
+
+
+def test_wrong_username_is_refused_the_same_way(live):
+    status, body, _ = login(live, username="admin")  # right password, wrong username
+    assert status == 401
+    assert b"Wrong username or password." in body
+    for _ in range(4):
+        login(live, username="admin")
+    assert login(live)[0] == 429  # wrong usernames count towards the lockout too
 
 
 def test_lockout_after_too_many_wrong_passwords(live):
@@ -161,7 +186,7 @@ def test_lockout_after_too_many_wrong_passwords(live):
     status, body, hdrs = login(live, "nope")
     assert status == 429
     assert int(hdrs["retry-after"]) > 0
-    assert b"blocked" in body
+    assert b"Too many attempts" in body
     assert login(live)[0] == 429  # even the right password waits out the lockout
 
 
