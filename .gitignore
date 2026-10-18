@@ -1,6 +1,11 @@
-venv
-uploads
+# Secrets and data: never commit these.
 config.json
+config/
+.env
+uploads
+
+# Local tooling
+venv
 __pycache__/
 *.pyc
 .pytest_cache/

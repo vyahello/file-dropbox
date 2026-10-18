@@ -1,0 +1,20 @@
+services:
+  file-dropbox:
+    build: .
+    image: file-dropbox:latest
+    container_name: file-dropbox
+    restart: unless-stopped
+    # Run as your own user so everything in ./uploads and ./config belongs to you.
+    # If `id -u` isn't 1000, put DROPBOX_UID / DROPBOX_GID in a .env file.
+    user: "${DROPBOX_UID:-1000}:${DROPBOX_GID:-1000}"
+    ports:
+      - "47921:47921"
+    volumes:
+      - ./uploads:/app/uploads   # every uploaded file, right on this machine
+      - ./config:/app/config     # config.json with the token and admin password hash
+    # Hardening: nothing in the container is writable except the two mounts.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

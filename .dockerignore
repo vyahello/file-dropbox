@@ -1,0 +1,15 @@
+# Keep secrets, uploads and dev clutter out of the build context and the image.
+.git
+.gitignore
+.dockerignore
+.env
+config.json
+config/
+uploads/
+venv/
+.idea/
+__pycache__/
+*.pyc
+.pytest_cache/
+test_*.py
+requirements-dev.txt
