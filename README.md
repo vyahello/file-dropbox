@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](compose.yaml)
-[![Tested with pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?logo=pytest&logoColor=white)](test_server.py)
+[![Tested with pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?logo=pytest&logoColor=white)](tests)
 [![Last commit](https://img.shields.io/github/last-commit/vyahello/file-dropbox)](https://github.com/vyahello/file-dropbox/commits)
 
 > A tiny, grumpy mailbox for your LAN. It takes files and doesn't chat.
@@ -46,8 +46,16 @@ Pick one.
 ```bash
 git clone https://github.com/vyahello/file-dropbox.git
 cd file-dropbox
-python3 server.py
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
+file-dropbox
 ```
+
+There are no dependencies to download: `pip install .` only installs
+file-dropbox itself and gives you the `file-dropbox` command. Rather not
+install anything? `PYTHONPATH=src python3 -m file_dropbox` runs it straight
+from the checkout.
 
 **With Docker:**
 
@@ -69,7 +77,7 @@ Upload token (give it only to trusted clients, keep it secret):
   pX3...your-token...9Qk
 Admin password for the web UI at /admin (shown only this once):
   Fq7...your-password...2wE
-Change it any time with: python3 manage_token.py admin-password
+Change it any time with: file-dropbox admin-password
 ======================================================================
 File-drop server listening on http://0.0.0.0:47921
 ```
@@ -209,7 +217,8 @@ other client's files. The admin password stays with the owner.
 Forgot the password, or want your own?
 
 ```bash
-python3 manage_token.py admin-password        # Docker: docker compose exec file-dropbox python manage_token.py admin-password
+file-dropbox admin-password
+docker compose exec file-dropbox file-dropbox admin-password   # with Docker
 ```
 
 Type a new one (at least 12 characters) or press Enter to generate one, then
@@ -267,8 +276,8 @@ Good to know:
 
 ## ⚙️ Configuration
 
-Everything lives in `config.json`, next to `server.py` (or in `./config/` with
-Docker). Set `FILE_DROPBOX_CONFIG` to keep it somewhere else.
+Everything lives in `config.json` in the folder you start the server from (or
+in `./config/` with Docker). Set `FILE_DROPBOX_CONFIG` to keep it somewhere else.
 
 ```json
 {
@@ -290,11 +299,11 @@ Docker). Set `FILE_DROPBOX_CONFIG` to keep it somewhere else.
 |-----------------------|-----------|--------------------------------------------------------------------------------|
 | `host`                | `0.0.0.0` | All interfaces. Use one LAN IP to restrict it, or `127.0.0.1` for local only.  |
 | `port`                | `47921`   | Deliberately not 80 or 8080.                                                   |
-| `upload_root`         | `uploads` | Relative to `server.py`, or an absolute path.                                  |
+| `upload_root`         | `uploads` | Relative to the folder you start the server from, or an absolute path.         |
 | `max_upload_bytes`    | 1 GiB     | Hard cap per request.                                                          |
 | `api_token`           | random    | If empty, every upload is refused with `503`.                                  |
 | `admin_path`          | `/admin`  | Where the admin page lives. Pick something less guessable if you like. `""` turns it off. |
-| `admin_password_hash` | generated | Set it with `manage_token.py admin-password`, never by hand.                   |
+| `admin_password_hash` | generated | Set it with `file-dropbox admin-password`, never by hand.                      |
 | `session_minutes`     | `30`      | Idle time before the admin is signed out.                                      |
 | `secure_cookies`      | `false`   | Set `true` when the server is behind HTTPS, so the cookie is never sent over plain HTTP. |
 | `max_failed_logins`   | `5`       | Wrong tokens or passwords allowed per address...                              |
@@ -306,14 +315,15 @@ secrets. It's in `.gitignore`, so keep it out of git.
 ### 🔑 Managing secrets
 
 ```bash
-python3 manage_token.py show            # print the current upload token
-python3 manage_token.py rotate          # new random upload token; the old one stops working
-python3 manage_token.py set MYTOKEN     # set a specific upload token
-python3 manage_token.py admin-password  # set or generate a new admin password
+file-dropbox token show          # print the current upload token
+file-dropbox token rotate        # new random upload token; the old one stops working
+file-dropbox token set MYTOKEN   # set a specific upload token
+file-dropbox admin-password      # set or generate a new admin password
+file-dropbox --help              # everything else
 ```
 
 Restart the server after any change. With Docker, prefix the command with
-`docker compose exec file-dropbox` and use `python` instead of `python3`.
+`docker compose exec file-dropbox`.
 
 ---
 
@@ -362,21 +372,61 @@ grep "$(date +%F)" uploads/alice-laptop/uploads.jsonl
 
 ---
 
+## 🧭 Project layout
+
+```
+file-dropbox/
+├── src/file_dropbox/      the package
+│   ├── cli.py             the file-dropbox command
+│   ├── config.py          loading and saving config.json
+│   ├── server.py          HTTP server and the upload endpoint
+│   ├── admin.py           the admin page: routes and HTML
+│   ├── storage.py         how uploads are laid out on disk
+│   ├── security.py        password hashing, lockout, sessions
+│   └── static/            admin stylesheet and icon
+├── tests/                 pytest suite
+├── pyproject.toml         package metadata, the file-dropbox command, pytest settings
+├── Dockerfile
+└── compose.yaml
+```
+
+### Upgrading from the single-file version
+
+Older versions were run as `python3 server.py` from the repository root.
+Your `config.json` and `uploads/` stay exactly where they are. Only the
+commands change:
+
+| Before                                  | Now                           |
+|-----------------------------------------|-------------------------------|
+| `python3 server.py`                     | `file-dropbox`                |
+| `python3 manage_token.py show`          | `file-dropbox token show`     |
+| `python3 manage_token.py rotate`        | `file-dropbox token rotate`   |
+| `python3 manage_token.py set TOKEN`     | `file-dropbox token set TOKEN` |
+| `python3 manage_token.py admin-password` | `file-dropbox admin-password` |
+
+Run them from the folder that holds `config.json` and `uploads/`, since
+relative paths are resolved from where you start the command.
+
+---
+
 ## 🧪 Running the tests
 
 ```bash
-python3 -m venv venv
-./venv/bin/pip install -r requirements-dev.txt
-./venv/bin/python -m pytest -v
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest -v
 ```
 
-| File               | Covers                                                                       |
-|--------------------|------------------------------------------------------------------------------|
-| `test_server.py`   | Uploads: auth, lockout, method rejection, both upload styles, folders, sanitizing, size limits, logging |
-| `test_admin.py`    | Admin page: sign-in, lockout, cookies, CSRF and origin checks, browsing, previews, downloads, path traversal |
-| `test_security.py` | Password hashing, the lockout limiter and sessions, with a fake clock       |
+| File                     | Covers                                                                 |
+|--------------------------|------------------------------------------------------------------------|
+| `tests/test_server.py`   | Uploads: auth, lockout, method rejection, both upload styles, folders, size limits, logging |
+| `tests/test_admin.py`    | Admin page: sign-in, lockout, cookies, CSRF and origin checks, browsing, previews, downloads, path traversal |
+| `tests/test_storage.py`  | File names, writing without overwriting, listing and resolving stored files |
+| `tests/test_cli.py`      | First-run config, upgrades, `0600` permissions, the token and admin-password commands |
+| `tests/test_security.py` | Password hashing, the lockout limiter and sessions, with a fake clock  |
 
-The server tests start a real server on a random port.
+The server and admin tests start a real server on a random port.
 
 ---
 
