@@ -442,9 +442,13 @@ def render_file(session: Session, client: str, rel: str, path: str, meta: Dict[s
             if meta.get("source_ip") else "Not recorded"
         )),
         ("User-Agent", meta.get("user_agent") or "Not recorded"),
-        ("Hostname (claimed)", meta.get("hostname_claimed") or "Not sent"),
         ("Stored as", f"uploads/{client}/{rel}"),
     ]
+    # X-Client-Host is optional and usually the same as the client ID, so only
+    # show it when it adds something.
+    hostname = meta.get("hostname_claimed")
+    if hostname and hostname != client:
+        facts.insert(-1, ("Hostname (as reported by the client)", hostname))
     if meta.get("original_filename") and meta["original_filename"] != name:
         facts.insert(1, ("Original name", meta["original_filename"]))
     fact_html = "\n".join(f"<div><dt>{h(k)}</dt><dd>{h(v)}</dd></div>" for k, v in facts)

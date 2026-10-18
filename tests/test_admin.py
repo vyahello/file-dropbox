@@ -274,6 +274,18 @@ def test_text_preview_is_escaped(live, cookie):
     assert b"127.0.0.1" in body  # upload metadata is shown
 
 
+@pytest.mark.parametrize("host, shown", [("", False), ("alice", False), ("alice-pc", True)])
+def test_hostname_is_shown_only_when_it_adds_something(live, cookie, host, shown):
+    status, body, _ = request(live.port, "POST", "/upload", b"h", {
+        "Authorization": "Bearer " + TOKEN, "X-Client-Id": "alice",
+        "X-Filename": f"host-{host or 'none'}.txt", "X-Client-Host": host,
+    })
+    assert status == 201
+    _, page, _ = get(live, f"/admin/files/alice/{json.loads(body)['files'][0]['path']}", cookie)
+    assert (b"Hostname" in page) is shown
+    assert (b"alice-pc" in page) is shown
+
+
 def test_download_is_a_sandboxed_attachment(live, cookie):
     status, body, hdrs = get(live, f"/admin/raw/alice/{live.notes}?download=1", cookie)
     assert status == 200
