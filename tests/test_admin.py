@@ -10,7 +10,6 @@ import json
 import os
 import re
 import threading
-from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 from typing import Dict
@@ -73,7 +72,7 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         "admin_username": USERNAME,
         "admin_password_hash": hash_password(PASSWORD, iterations=1000),
     })
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.DropHandler)
+    httpd = server.DropServer(("127.0.0.1", 0), server.DropHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     port = httpd.server_address[1]

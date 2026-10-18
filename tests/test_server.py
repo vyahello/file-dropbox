@@ -14,7 +14,6 @@ import json
 import os
 import socket
 import threading
-from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Dict
 from typing import Iterator
@@ -70,7 +69,7 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         "max_upload_bytes": 1073741824,
         "api_token": TOKEN,
     })
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.DropHandler)
+    httpd = server.DropServer(("127.0.0.1", 0), server.DropHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -120,6 +119,31 @@ def test_parse_multipart_ignores_non_file_fields():
 # --------------------------------------------------------------------------
 # Method handling
 # --------------------------------------------------------------------------
+
+
+def raise_and_report(httpd: server.DropServer, exc: BaseException) -> None:
+    """Let the server's error hook handle ``exc`` the way socketserver would."""
+    try:
+        raise exc
+    except BaseException:
+        httpd.handle_error(None, ("203.0.113.9", 4242))
+
+
+@pytest.mark.parametrize("exc", [ConnectionResetError(104, "reset"), BrokenPipeError(), socket.timeout()])
+def test_client_hangups_are_not_reported(exc, capsys):
+    httpd = server.DropServer.__new__(server.DropServer)  # no socket needed
+    raise_and_report(httpd, exc)
+    assert capsys.readouterr().err == ""
+
+
+def test_real_errors_are_still_reported(capsys):
+    httpd = server.DropServer.__new__(server.DropServer)
+    raise_and_report(httpd, ValueError("boom"))
+    assert "ValueError: boom" in capsys.readouterr().err
+
+
+def test_idle_connections_time_out():
+    assert server.DropHandler.timeout == 60
 
 
 def test_responses_do_not_name_the_software(live):

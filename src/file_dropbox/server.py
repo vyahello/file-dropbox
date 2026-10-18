@@ -20,6 +20,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sys
 from datetime import datetime
 from datetime import timezone
@@ -167,6 +168,9 @@ class DropHandler(admin.AdminRoutes):
     """
 
     protocol_version = "HTTP/1.1"
+    # Drop connections that go quiet for this long, so idle or deliberately slow
+    # clients can't tie up a thread each (a "slowloris" attack).
+    timeout = 60
 
     # ---- response helpers ------------------------------------------------
 
@@ -444,6 +448,20 @@ class DropHandler(admin.AdminRoutes):
         """Silence the default noisy stderr logging; :meth:`access_log` does ours."""
 
 
+class DropServer(ThreadingHTTPServer):
+    """The HTTP server: one thread per connection, quiet about clients hanging up."""
+
+    def handle_error(self, request: Any, client_address: Tuple[str, int]) -> None:
+        """Ignore clients that disconnect mid-request; report anything else.
+
+        Browsers routinely drop idle keep-alive connections, and the default
+        handler prints a full traceback for each one.
+        """
+        if isinstance(sys.exc_info()[1], (ConnectionError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
+
+
 def _stop(signum: int, frame: Any) -> None:
     """Turn SIGTERM (``docker stop``) into the same clean exit as Ctrl+C."""
     raise KeyboardInterrupt
@@ -452,7 +470,7 @@ def _stop(signum: int, frame: Any) -> None:
 def serve(cfg: Config) -> None:
     """Apply ``cfg`` and serve until Ctrl+C or SIGTERM."""
     configure(cfg)
-    httpd = ThreadingHTTPServer((cfg["host"], cfg["port"]), DropHandler)
+    httpd = DropServer((cfg["host"], cfg["port"]), DropHandler)
     signal.signal(signal.SIGTERM, _stop)
     print(f"File-drop server listening on http://{cfg['host']}:{cfg['port']}")
     print("Upload endpoint: POST /upload   (POST only; all else -> 404)")
