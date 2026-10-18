@@ -6,11 +6,14 @@ Behavior
 --------
 - Accepts ONLY POST requests (uploads). Every other method -> generic 404 (no Allow header).
 - Requires a bearer token / API key. Missing creds -> 401, bad creds -> 403.
+  Too many bad tokens from one address -> 429 for a while (brute-force lockout).
 - Files land in uploads/<client>/<YYYY-MM-DD>/ under their original names;
   a name clash gets a numeric suffix (report.pdf, report-1.pdf, ...).
 - Records who sent what: date, time, client, IP, User-Agent, filename, size,
   content-type -> one line per file in uploads/<client>/uploads.jsonl, plus a
   combined server access log.
+- The one exception to "POST only": the owner's admin UI under /admin (see
+  admin.py), protected by a separate admin password.
 
 Standard library only. Python 3.8+.
 """
@@ -20,11 +23,11 @@ import json
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 from datetime import datetime
 from datetime import timezone
-from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from typing import Any
 from typing import Dict
@@ -32,8 +35,14 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+import admin
+from security import LoginLimiter
+from security import client_key
+from security import hash_password
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
+# FILE_DROPBOX_CONFIG lets Docker keep config.json in a mounted folder.
+CONFIG_PATH = os.environ.get("FILE_DROPBOX_CONFIG") or os.path.join(HERE, "config.json")
 
 Config = Dict[str, Any]
 Meta = Dict[str, Any]
@@ -50,32 +59,69 @@ DEFAULT_CONFIG: Config = {
     "upload_root": "uploads",   # relative to this file, or absolute
     "max_upload_bytes": 1073741824,  # 1 GiB hard cap per request
     "api_token": "",  # single shared bearer token; auto-generated on first run
+    "admin_path": "/admin",     # owner's web UI; "" turns it off
+    "admin_password_hash": "",  # PBKDF2 hash; auto-generated on first run
+    "session_minutes": 30,      # admin is signed out after this much idle time
+    "secure_cookies": False,    # set true when served over HTTPS (reverse proxy)
+    "max_failed_logins": 5,     # wrong tokens/passwords before an address is locked out
+    "lockout_minutes": 15,      # ...and for how long
 }
 
 
 def load_config() -> Config:
-    """Load ``config.json``, creating it with a fresh API token on first run.
+    """Load config.json, filling in anything missing.
 
-    Missing keys are filled in from :data:`DEFAULT_CONFIG`.
+    On first run this creates the file with a fresh upload token. Whenever the
+    admin UI is on but has no password yet (first run, or an upgrade from an
+    older version), it generates one, stores only its hash and prints the
+    password once. Missing keys are filled in from :data:`DEFAULT_CONFIG`.
     """
-    if not os.path.exists(CONFIG_PATH):
+    created = not os.path.exists(CONFIG_PATH)
+    if created:
         cfg = dict(DEFAULT_CONFIG)
         cfg["api_token"] = secrets.token_urlsafe(32)
-        with open(CONFIG_PATH, "w") as fh:
-            json.dump(cfg, fh, indent=2)
-        print("=" * 70)
-        print("No config.json found -> created one with a fresh API token.")
-        print("Shared bearer token (give it only to trusted clients, keep it secret):")
-        print(f"  {cfg['api_token']}")
-        print("Change it in config.json, or run: python3 manage_token.py rotate")
-        print("=" * 70)
-        return cfg
+    else:
+        with open(CONFIG_PATH) as fh:
+            cfg = json.load(fh)
+        for key, val in DEFAULT_CONFIG.items():
+            cfg.setdefault(key, val)
 
-    with open(CONFIG_PATH) as fh:
-        cfg = json.load(fh)
-    for key, val in DEFAULT_CONFIG.items():
-        cfg.setdefault(key, val)
+    notes: List[str] = []
+    if created:
+        notes += [
+            f"No config found -> created {CONFIG_PATH} with a fresh upload token.",
+            "Upload token (give it only to trusted clients, keep it secret):",
+            f"  {cfg['api_token']}",
+        ]
+    if cfg["admin_path"] and not cfg["admin_password_hash"]:
+        password = secrets.token_urlsafe(18)
+        cfg["admin_password_hash"] = hash_password(password)
+        notes += [
+            f"Admin password for the web UI at {cfg['admin_path']} (shown only this once):",
+            f"  {password}",
+            "Change it any time with: python3 manage_token.py admin-password",
+        ]
+    if notes:
+        save_config(cfg)
+        print("=" * 70)
+        print("\n".join(notes))
+        print("=" * 70)
     return cfg
+
+
+def save_config(cfg: Config) -> None:
+    """Write config.json readable by its owner only, since it holds secrets."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
+    except PermissionError:
+        sys.exit(
+            f"Can't write {CONFIG_PATH}: permission denied. "
+            "Make sure that folder belongs to the user running the server."
+        )
 
 
 # Runtime state, populated by configure(). Declared here so the handler's
@@ -88,6 +134,7 @@ API_TOKEN: str = ""                    # single shared bearer token
 MAX_BYTES: int = int(DEFAULT_CONFIG["max_upload_bytes"])
 INDEX_NAME = "uploads.jsonl"           # per-client metadata index
 _INDEX_LOCK = threading.Lock()         # keeps concurrent JSONL appends whole
+LIMITER = LoginLimiter()               # brute-force lockout, shared with the admin UI
 
 
 def configure(cfg: Config) -> Config:
@@ -99,7 +146,7 @@ def configure(cfg: Config) -> Config:
     Returns:
         The same ``cfg``, for convenience.
     """
-    global CONFIG, UPLOAD_ROOT, LOG_DIR, ACCESS_LOG, API_TOKEN, MAX_BYTES
+    global CONFIG, UPLOAD_ROOT, LOG_DIR, ACCESS_LOG, API_TOKEN, MAX_BYTES, LIMITER
     CONFIG = cfg
     root = cfg["upload_root"]
     if not os.path.isabs(root):
@@ -110,6 +157,25 @@ def configure(cfg: Config) -> Config:
     API_TOKEN = cfg.get("api_token", "")
     MAX_BYTES = int(cfg["max_upload_bytes"])
     os.makedirs(LOG_DIR, exist_ok=True)
+
+    def setting(key: str) -> Any:
+        return cfg.get(key, DEFAULT_CONFIG[key])
+
+    lockout = float(setting("lockout_minutes")) * 60
+    LIMITER = LoginLimiter(
+        max_failures=int(setting("max_failed_logins")),
+        window_seconds=lockout,
+        lockout_seconds=lockout,
+    )
+    admin.configure(
+        path=setting("admin_path"),
+        password_hash=setting("admin_password_hash"),
+        upload_root=UPLOAD_ROOT,
+        access_log=ACCESS_LOG,
+        session_minutes=float(setting("session_minutes")),
+        secure_cookies=bool(setting("secure_cookies")),
+        limiter=LIMITER,
+    )
     return cfg
 
 # --------------------------------------------------------------------------
@@ -205,8 +271,11 @@ def parse_multipart(body: bytes, boundary: bytes) -> List[MultipartFile]:
 # --------------------------------------------------------------------------
 
 
-class DropHandler(BaseHTTPRequestHandler):
-    """HTTP handler that accepts authenticated POST uploads and nothing else."""
+class DropHandler(admin.AdminRoutes):
+    """HTTP handler that accepts authenticated POST uploads and nothing else.
+
+    The only other thing it answers is the owner's admin UI (see admin.py).
+    """
 
     server_version = "FileDrop/1.0"
     protocol_version = "HTTP/1.1"
@@ -245,8 +314,14 @@ class DropHandler(BaseHTTPRequestHandler):
         """
         self.send_json(404, {"error": "not found"})
 
-    # Only POST is served; every other method is a generic 404.
-    do_GET = reject_method
+    def do_GET(self) -> None:
+        """Serve the admin UI; any other GET is the same bland 404."""
+        if self.is_admin_request():
+            self.handle_admin_get()
+        else:
+            self.reject_method()
+
+    # Only POST (and the admin UI) is served; every other method is a generic 404.
     do_HEAD = reject_method
     do_PUT = reject_method
     do_DELETE = reject_method
@@ -260,9 +335,12 @@ class DropHandler(BaseHTTPRequestHandler):
 
         Accepts ``Authorization: Bearer <token>`` or ``X-API-Key: <token>``.
 
+        An address that sends too many wrong tokens is locked out for a while
+        (the same lockout that protects the admin password).
+
         Returns:
-            True if the token matches. Otherwise an error response (401, 403
-            or 503) has already been sent and False is returned.
+            True if the token matches. Otherwise an error response (401, 403,
+            429 or 503) has already been sent and False is returned.
         """
         if not API_TOKEN:
             self.access_log("NO-TOKEN-CONFIGURED", "-", 503)
@@ -286,17 +364,34 @@ class DropHandler(BaseHTTPRequestHandler):
             )
             return False
 
-        if hmac.compare_digest(token, API_TOKEN):
+        key = client_key(self.client_address[0])
+        wait = LIMITER.retry_after(key)
+        if wait:
+            self.access_log("AUTH-LOCKED", "-", 429)
+            self.send_json(
+                429,
+                {"error": "too many failed attempts", "retry_after_seconds": wait},
+                {"Retry-After": str(wait)},
+            )
+            return False
+
+        # Compare bytes: compare_digest raises on non-ASCII str, and headers can be anything.
+        if hmac.compare_digest(token.encode("utf-8"), API_TOKEN.encode("utf-8")):
+            LIMITER.record_success(key)
             return True
 
-        self.access_log("AUTH-BAD", "-", 403)
+        left = LIMITER.record_failure(key)
+        self.access_log("AUTH-BAD", "-", 403, extra=f"{left} tries left" if left else "address locked out")
         self.send_json(403, {"error": "invalid credentials"})
         return False
 
     def client_id(self) -> str:
-        """Return who sent this: the declared X-Client-Id/Name, else ``ip-<addr>``."""
+        """Return who sent this: the declared X-Client-Id/Name, else ``ip-<addr>``.
+
+        Leading underscores are dropped: names like ``_logs`` are reserved.
+        """
         cid = self.headers.get("X-Client-Id") or self.headers.get("X-Client-Name") or ""
-        cid = safe_filename(cid) if cid.strip() else ""
+        cid = safe_filename(cid).lstrip("_") if cid.strip() else ""
         if not cid:
             cid = "ip-" + self.client_address[0].replace(":", "_")
         return cid
@@ -305,6 +400,9 @@ class DropHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         """Handle an upload: authenticate, read the body, store every file."""
+        if self.is_admin_request():
+            self.handle_admin_post()
+            return
         if not self.authenticate():
             return
         client = self.client_id()
@@ -450,20 +548,31 @@ class DropHandler(BaseHTTPRequestHandler):
         """Silence the default noisy stderr logging; :meth:`access_log` does ours."""
 
 
+def _stop(signum: int, frame: Any) -> None:
+    """Turn SIGTERM (``docker stop``) into the same clean exit as Ctrl+C."""
+    raise KeyboardInterrupt
+
+
 def main() -> None:
-    """Load config and serve until Ctrl+C."""
+    """Load config and serve until Ctrl+C or SIGTERM."""
     cfg = configure(load_config())
     httpd = ThreadingHTTPServer((cfg["host"], cfg["port"]), DropHandler)
+    signal.signal(signal.SIGTERM, _stop)
     print(f"File-drop server listening on http://{cfg['host']}:{cfg['port']}")
     print("Upload endpoint: POST /upload   (POST only; all else -> 404)")
     print(f"Storing files under: {UPLOAD_ROOT}")
     print(f"Auth: shared bearer token ({'set' if API_TOKEN else 'MISSING - edit config.json'})")
+    if admin.PREFIX:
+        print(f"Admin UI: http://{cfg['host']}:{cfg['port']}{admin.PREFIX}/")
+    else:
+        print("Admin UI: off")
     print("Press Ctrl+C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
         httpd.shutdown()
+        httpd.server_close()
 
 
 if __name__ == "__main__":

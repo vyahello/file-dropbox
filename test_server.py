@@ -80,6 +80,13 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         thread.join(timeout=5)
 
 
+@pytest.fixture(autouse=True)
+def fresh_limiter() -> Iterator[None]:
+    """Every test starts with no failed attempts on record."""
+    yield
+    server.LIMITER.reset()
+
+
 def client_dir(live: SimpleNamespace, name: str) -> str:
     """Path of a client's upload folder inside the test upload root."""
     return os.path.join(live.root, name)
@@ -187,6 +194,23 @@ def test_x_api_key_header_also_authenticates(live):
         headers={"X-API-Key": TOKEN, "X-Client-Id": "apikey-client", "X-Filename": "k.txt"},
     )
     assert status == 201
+
+
+def test_repeated_wrong_tokens_lock_the_address_out(live):
+    for _ in range(5):
+        status, _, _ = do_request(live.port, "POST", body=b"x",
+                                  headers={"Authorization": "Bearer nope", "X-Filename": "a"})
+        assert status == 403
+    status, body, hdrs = do_request(live.port, "POST", body=b"x", headers=auth(**{"X-Filename": "a"}))
+    assert status == 429  # even the right token waits out the lockout
+    assert int(hdrs["retry-after"]) > 0
+    assert json.loads(body)["error"] == "too many failed attempts"
+
+
+def test_non_ascii_token_is_rejected_not_crashing(live):
+    status, _, _ = do_request(live.port, "POST", body=b"x",
+                              headers={"Authorization": "Bearer t\u00f6ken", "X-Filename": "a"})
+    assert status == 403
 
 
 def test_no_token_configured_is_503(live, monkeypatch):
@@ -300,6 +324,21 @@ def test_missing_client_id_falls_back_to_ip(live):
     assert status == 201
     assert json.loads(body)["files"][0]["client"] == "ip-127.0.0.1"
     assert os.path.isdir(client_dir(live, "ip-127.0.0.1"))
+
+
+def test_reserved_client_names_are_renamed(live):
+    status, body, _ = do_request(
+        live.port, "POST", body=b"x",
+        headers=auth(**{"X-Client-Id": "_logs", "X-Filename": "f.txt"}),
+    )
+    assert status == 201
+    assert json.loads(body)["client"] == "logs"
+
+
+def test_admin_ui_is_off_without_a_password(live):
+    status, body, _ = do_request(live.port, "GET", path="/admin/login")
+    assert status == 404
+    assert json.loads(body) == {"error": "not found"}
 
 
 def test_two_client_ids_two_folders(live):
