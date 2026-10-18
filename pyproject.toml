@@ -21,7 +21,12 @@ classifiers = [
 dependencies = []  # standard library only
 
 [project.optional-dependencies]
-dev = ["pytest==9.1.1"]
+dev = [
+    # The newest pytest for each supported Python (pytest 9 needs 3.10+).
+    "pytest==9.1.1; python_version >= '3.10'",
+    "pytest==8.4.2; python_version == '3.9'",
+    "pytest==8.3.5; python_version < '3.9'",
+]
 
 [project.scripts]
 file-dropbox = "file_dropbox.cli:main"
