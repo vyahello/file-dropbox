@@ -30,7 +30,6 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
-from file_dropbox import __version__
 from file_dropbox import admin
 from file_dropbox.config import DEFAULT_CONFIG
 from file_dropbox.config import Config
@@ -158,7 +157,6 @@ class DropHandler(admin.AdminRoutes):
     The only other thing it answers is the owner's admin UI (see admin.py).
     """
 
-    server_version = f"FileDrop/{__version__}"
     protocol_version = "HTTP/1.1"
 
     # ---- response helpers ------------------------------------------------
@@ -186,6 +184,24 @@ class DropHandler(admin.AdminRoutes):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def send_response(self, code: int, message: Optional[str] = None) -> None:
+        """Like the standard one, minus the ``Server`` header that names the software."""
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
+
+    def send_error(self, code: int, message: Optional[str] = None, explain: Optional[str] = None) -> None:
+        """Answer malformed requests with the same bland JSON as everything else.
+
+        The standard version sends an HTML page that gives away Python's
+        http.server. Unknown methods (501 there) get the generic 404, exactly
+        like GET or PUT.
+        """
+        if code == 501:
+            self.reject_method()
+        else:
+            self.send_json(code, {"error": "bad request"})
 
     def reject_method(self) -> None:
         """Answer any non-POST method with a bland 404.

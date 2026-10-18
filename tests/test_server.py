@@ -12,6 +12,7 @@ Run:  pytest -v
 import http.client
 import json
 import os
+import socket
 import threading
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
@@ -119,6 +120,31 @@ def test_parse_multipart_ignores_non_file_fields():
 # --------------------------------------------------------------------------
 # Method handling
 # --------------------------------------------------------------------------
+
+
+def test_responses_do_not_name_the_software(live):
+    _, _, hdrs = do_request(live.port, "GET", path="/")
+    assert "server" not in hdrs
+
+
+def test_unknown_method_is_the_same_404(live):
+    status, body, hdrs = do_request(live.port, "FOO")
+    assert status == 404
+    assert json.loads(body) == {"error": "not found"}
+    assert "allow" not in hdrs
+
+
+def test_malformed_request_gets_bland_json(live):
+    headers = "".join(f"X-H{i}: v\r\n" for i in range(150))  # over http.server's header limit
+    with socket.create_connection(("127.0.0.1", live.port), timeout=5) as sock:
+        sock.sendall(f"GET / HTTP/1.1\r\nHost: x\r\n{headers}\r\n".encode())
+        reply = b""
+        while chunk := sock.recv(65536):
+            reply += chunk
+    head, _, body = reply.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 431")
+    assert json.loads(body) == {"error": "bad request"}
+    assert b"Server:" not in head and b"Python" not in reply
 
 
 def test_get_is_404_without_allow_header(live):
