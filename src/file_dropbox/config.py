@@ -61,17 +61,32 @@ def new_username() -> str:
     return f"owner-{secrets.token_hex(3)}"
 
 
+def permission_message(action: str, path: str) -> str:
+    """Explain a permission error, naming the user the server runs as."""
+    who = f"uid {os.getuid()}, gid {os.getgid()}" if hasattr(os, "getuid") else "this user"
+    return (
+        f"Can't {action} {path}: permission denied. It must belong to the user "
+        f"running the server ({who}). Fix the owner with chown, or with Docker "
+        "set DROPBOX_UID and DROPBOX_GID in .env to the folder's owner (see README)."
+    )
+
+
 def read_config(path: Optional[str] = None) -> Config:
     """Read an existing config file as-is.
 
     Raises:
-        ConfigError: if the file doesn't exist yet.
+        ConfigError: if the file doesn't exist yet, isn't readable or isn't valid JSON.
     """
     path = path or config_path()
     if not os.path.exists(path):
         raise ConfigError(f"{path} not found. Start the server once to create it.")
-    with open(path) as fh:
-        return json.load(fh)
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except PermissionError:
+        raise ConfigError(permission_message("read", path)) from None
+    except ValueError as exc:
+        raise ConfigError(f"{path} isn't valid JSON: {exc}") from None
 
 
 def save_config(cfg: Config, path: Optional[str] = None) -> None:
@@ -88,10 +103,7 @@ def save_config(cfg: Config, path: Optional[str] = None) -> None:
             json.dump(cfg, fh, indent=2)
         os.chmod(path, 0o600)
     except PermissionError:
-        raise ConfigError(
-            f"Can't write {path}: permission denied. "
-            "Make sure that folder belongs to the user running the server."
-        ) from None
+        raise ConfigError(permission_message("write", path)) from None
 
 
 def load_config(path: Optional[str] = None) -> Config:

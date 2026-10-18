@@ -33,6 +33,8 @@ from typing import Tuple
 from file_dropbox import admin
 from file_dropbox.config import DEFAULT_CONFIG
 from file_dropbox.config import Config
+from file_dropbox.config import ConfigError
+from file_dropbox.config import permission_message
 from file_dropbox.security import LoginLimiter
 from file_dropbox.security import client_key
 from file_dropbox.storage import Meta
@@ -63,6 +65,9 @@ def configure(cfg: Config) -> Config:
 
     Returns:
         The same ``cfg``, for convenience.
+
+    Raises:
+        ConfigError: if the upload folder isn't writable.
     """
     global CONFIG, UPLOAD_ROOT, LOG_DIR, ACCESS_LOG, API_TOKEN, MAX_BYTES, LIMITER
     CONFIG = cfg
@@ -71,7 +76,10 @@ def configure(cfg: Config) -> Config:
     ACCESS_LOG = os.path.join(LOG_DIR, "access.log")
     API_TOKEN = cfg.get("api_token", "")
     MAX_BYTES = int(cfg["max_upload_bytes"])
-    os.makedirs(LOG_DIR, exist_ok=True)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except PermissionError:
+        raise ConfigError(permission_message("write to", UPLOAD_ROOT)) from None
 
     def setting(key: str) -> Any:
         return cfg.get(key, DEFAULT_CONFIG[key])

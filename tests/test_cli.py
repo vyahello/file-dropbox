@@ -165,6 +165,48 @@ def test_bad_admin_input_changes_nothing(config_file, monkeypatch, capsys, usern
     assert read(config_file) == before
 
 
+needs_non_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read anything",
+)
+
+
+@needs_non_root
+def test_unreadable_config_is_explained(config_file, capsys):
+    load_config()
+    os.chmod(config_file, 0o000)
+    try:
+        assert cli.main(["token", "show"]) == 1
+    finally:
+        os.chmod(config_file, 0o600)
+    err = capsys.readouterr().err
+    assert "permission denied" in err and f"uid {os.getuid()}" in err
+    assert "Traceback" not in err
+
+
+@needs_non_root
+def test_unwritable_upload_folder_is_explained(config_file, tmp_path, capsys):
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    load_config()
+    cfg = read(config_file)
+    cfg["upload_root"] = str(locked / "uploads")
+    with open(config_file, "w") as fh:
+        json.dump(cfg, fh)
+    try:
+        assert cli.main(["serve"]) == 1
+    finally:
+        locked.chmod(0o700)
+    assert "Can't write to" in capsys.readouterr().err
+
+
+def test_broken_config_is_explained(config_file, capsys):
+    os.makedirs(os.path.dirname(config_file))
+    with open(config_file, "w") as fh:
+        fh.write("{not json")
+    assert cli.main(["token", "show"]) == 1
+    assert "isn't valid JSON" in capsys.readouterr().err
+
+
 def test_version_flag(capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["--version"])
