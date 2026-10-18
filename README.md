@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](compose.yaml)
-[![Tested with pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?logo=pytest&logoColor=white)](tests)
+[![Tests](https://github.com/vyahello/file-dropbox/actions/workflows/tests.yml/badge.svg)](https://github.com/vyahello/file-dropbox/actions/workflows/tests.yml)
 [![Last commit](https://img.shields.io/github/last-commit/vyahello/file-dropbox)](https://github.com/vyahello/file-dropbox/commits)
 
 > A tiny, grumpy mailbox for your LAN. It takes files and doesn't chat.
@@ -385,6 +385,7 @@ file-dropbox/
 │   ├── security.py        password hashing, lockout, sessions
 │   └── static/            admin stylesheet and icon
 ├── tests/                 pytest suite
+├── .github/workflows/     CI: the tests on Python 3.8 to 3.14
 ├── pyproject.toml         package metadata, the file-dropbox command, pytest settings
 ├── Dockerfile
 └── compose.yaml
@@ -427,6 +428,9 @@ pytest -v
 | `tests/test_security.py` | Password hashing, the lockout limiter and sessions, with a fake clock  |
 
 The server and admin tests start a real server on a random port.
+
+GitHub Actions runs the suite on every push to `master` and every pull request,
+on each Python version from 3.8 to 3.14 (see `.github/workflows/tests.yml`).
 
 ---
 
