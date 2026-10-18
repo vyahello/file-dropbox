@@ -4,9 +4,13 @@ config/
 .env
 uploads
 
-# Local tooling
+# Local tooling and build output
 venv
+.venv
 __pycache__/
 *.pyc
 .pytest_cache/
 .idea/
+build/
+dist/
+*.egg-info/

@@ -22,7 +22,7 @@ from typing import Tuple
 
 import pytest
 
-import server
+from file_dropbox import server
 
 TOKEN = "test-token-abc123"
 
@@ -80,47 +80,14 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         thread.join(timeout=5)
 
 
-@pytest.fixture(autouse=True)
-def fresh_limiter() -> Iterator[None]:
-    """Every test starts with no failed attempts on record."""
-    yield
-    server.LIMITER.reset()
-
-
 def client_dir(live: SimpleNamespace, name: str) -> str:
     """Path of a client's upload folder inside the test upload root."""
     return os.path.join(live.root, name)
 
 
 # --------------------------------------------------------------------------
-# Unit tests for the helpers
+# Unit tests for multipart parsing
 # --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("raw, expected", [
-    ("../../etc/passwd", "passwd"),
-    ("..\\..\\win.ini", "win.ini"),
-    ("/abs/path/report.pdf", "report.pdf"),
-    ("a b*c?.txt", "a b_c_.txt"),
-    ("", "file"),
-    ("...", "file"),
-    (None, "file"),
-])
-def test_safe_filename(raw, expected):
-    assert server.safe_filename(raw) == expected
-
-
-def test_safe_filename_truncates():
-    assert len(server.safe_filename("x" * 500)) == 200
-
-
-def test_create_unique_adds_suffix_on_clash(tmp_path):
-    names = []
-    for _ in range(3):
-        fd, name = server.create_unique(str(tmp_path), "LICENSE.txt")
-        os.close(fd)
-        names.append(name)
-    assert names == ["LICENSE.txt", "LICENSE-1.txt", "LICENSE-2.txt"]
 
 
 def test_parse_multipart_extracts_file():

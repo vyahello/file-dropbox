@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Authenticated file-drop server for a local network.
+The upload server.
 
 Behavior
 --------
@@ -13,19 +12,15 @@ Behavior
   content-type -> one line per file in uploads/<client>/uploads.jsonl, plus a
   combined server access log.
 - The one exception to "POST only": the owner's admin UI under /admin (see
-  admin.py), protected by a separate admin password.
-
-Standard library only. Python 3.8+.
+  :mod:`file_dropbox.admin`), protected by a separate admin password.
 """
 
 import hmac
 import json
 import os
 import re
-import secrets
 import signal
 import sys
-import threading
 from datetime import datetime
 from datetime import timezone
 from http.server import ThreadingHTTPServer
@@ -35,105 +30,29 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
-import admin
-from security import LoginLimiter
-from security import client_key
-from security import hash_password
+from file_dropbox import __version__
+from file_dropbox import admin
+from file_dropbox.config import DEFAULT_CONFIG
+from file_dropbox.config import Config
+from file_dropbox.security import LoginLimiter
+from file_dropbox.security import client_key
+from file_dropbox.storage import Meta
+from file_dropbox.storage import append_index
+from file_dropbox.storage import safe_filename
+from file_dropbox.storage import save_file
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# FILE_DROPBOX_CONFIG lets Docker keep config.json in a mounted folder.
-CONFIG_PATH = os.environ.get("FILE_DROPBOX_CONFIG") or os.path.join(HERE, "config.json")
-
-Config = Dict[str, Any]
-Meta = Dict[str, Any]
 # (field_name, filename, content_type, data) for one multipart file part.
 MultipartFile = Tuple[Optional[str], str, str, bytes]
 
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-DEFAULT_CONFIG: Config = {
-    "host": "0.0.0.0",          # bind on all interfaces; see README for locking down
-    "port": 47921,             # non-standard port (not 80/8080/21/etc.)
-    "upload_root": "uploads",   # relative to this file, or absolute
-    "max_upload_bytes": 1073741824,  # 1 GiB hard cap per request
-    "api_token": "",  # single shared bearer token; auto-generated on first run
-    "admin_path": "/admin",     # owner's web UI; "" turns it off
-    "admin_password_hash": "",  # PBKDF2 hash; auto-generated on first run
-    "session_minutes": 30,      # admin is signed out after this much idle time
-    "secure_cookies": False,    # set true when served over HTTPS (reverse proxy)
-    "max_failed_logins": 5,     # wrong tokens/passwords before an address is locked out
-    "lockout_minutes": 15,      # ...and for how long
-}
-
-
-def load_config() -> Config:
-    """Load config.json, filling in anything missing.
-
-    On first run this creates the file with a fresh upload token. Whenever the
-    admin UI is on but has no password yet (first run, or an upgrade from an
-    older version), it generates one, stores only its hash and prints the
-    password once. Missing keys are filled in from :data:`DEFAULT_CONFIG`.
-    """
-    created = not os.path.exists(CONFIG_PATH)
-    if created:
-        cfg = dict(DEFAULT_CONFIG)
-        cfg["api_token"] = secrets.token_urlsafe(32)
-    else:
-        with open(CONFIG_PATH) as fh:
-            cfg = json.load(fh)
-        for key, val in DEFAULT_CONFIG.items():
-            cfg.setdefault(key, val)
-
-    notes: List[str] = []
-    if created:
-        notes += [
-            f"No config found -> created {CONFIG_PATH} with a fresh upload token.",
-            "Upload token (give it only to trusted clients, keep it secret):",
-            f"  {cfg['api_token']}",
-        ]
-    if cfg["admin_path"] and not cfg["admin_password_hash"]:
-        password = secrets.token_urlsafe(18)
-        cfg["admin_password_hash"] = hash_password(password)
-        notes += [
-            f"Admin password for the web UI at {cfg['admin_path']} (shown only this once):",
-            f"  {password}",
-            "Change it any time with: python3 manage_token.py admin-password",
-        ]
-    if notes:
-        save_config(cfg)
-        print("=" * 70)
-        print("\n".join(notes))
-        print("=" * 70)
-    return cfg
-
-
-def save_config(cfg: Config) -> None:
-    """Write config.json readable by its owner only, since it holds secrets."""
-    try:
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(cfg, fh, indent=2)
-        os.chmod(CONFIG_PATH, 0o600)
-    except PermissionError:
-        sys.exit(
-            f"Can't write {CONFIG_PATH}: permission denied. "
-            "Make sure that folder belongs to the user running the server."
-        )
-
 
 # Runtime state, populated by configure(). Declared here so the handler's
-# global lookups always resolve; main() (and tests) call configure() to set them.
+# global lookups always resolve; serve() (and tests) call configure() to set them.
 CONFIG: Optional[Config] = None
 UPLOAD_ROOT: str = ""
 LOG_DIR: str = ""
 ACCESS_LOG: str = ""
 API_TOKEN: str = ""                    # single shared bearer token
 MAX_BYTES: int = int(DEFAULT_CONFIG["max_upload_bytes"])
-INDEX_NAME = "uploads.jsonl"           # per-client metadata index
-_INDEX_LOCK = threading.Lock()         # keeps concurrent JSONL appends whole
 LIMITER = LoginLimiter()               # brute-force lockout, shared with the admin UI
 
 
@@ -148,10 +67,7 @@ def configure(cfg: Config) -> Config:
     """
     global CONFIG, UPLOAD_ROOT, LOG_DIR, ACCESS_LOG, API_TOKEN, MAX_BYTES, LIMITER
     CONFIG = cfg
-    root = cfg["upload_root"]
-    if not os.path.isabs(root):
-        root = os.path.join(HERE, root)
-    UPLOAD_ROOT = root
+    UPLOAD_ROOT = os.path.abspath(cfg["upload_root"])  # relative to the current directory
     LOG_DIR = os.path.join(UPLOAD_ROOT, "_logs")
     ACCESS_LOG = os.path.join(LOG_DIR, "access.log")
     API_TOKEN = cfg.get("api_token", "")
@@ -178,6 +94,7 @@ def configure(cfg: Config) -> Config:
     )
     return cfg
 
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
@@ -186,42 +103,6 @@ def configure(cfg: Config) -> Config:
 def now() -> datetime:
     """Return the current time as a timezone-aware datetime in local time."""
     return datetime.now(timezone.utc).astimezone()
-
-
-def safe_filename(name: Optional[str]) -> str:
-    """Make ``name`` safe to use as a single path component.
-
-    Strips any directory part, replaces unusual characters with ``_`` and caps
-    the length at 200 characters, so path traversal is impossible. Falls back
-    to ``"file"`` if nothing usable is left.
-    """
-    name = (name or "").replace("\\", "/").split("/")[-1]
-    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip().strip(".")
-    return (name or "file")[:200]
-
-
-def create_unique(directory: str, filename: str) -> Tuple[int, str]:
-    """Atomically create a new file in ``directory``, never overwriting.
-
-    Tries ``filename`` first, then ``stem-1.ext``, ``stem-2.ext``, ... until
-    one doesn't exist. ``O_EXCL`` makes this safe across concurrent uploads.
-
-    Returns:
-        An open, writable file descriptor and the name actually used.
-    """
-    stem, ext = os.path.splitext(filename)
-    candidate, n = filename, 0
-    while True:
-        try:
-            fd = os.open(
-                os.path.join(directory, candidate),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-                0o644,
-            )
-            return fd, candidate
-        except FileExistsError:
-            n += 1
-            candidate = f"{stem}-{n}{ext}"
 
 
 def parse_multipart(body: bytes, boundary: bytes) -> List[MultipartFile]:
@@ -277,7 +158,7 @@ class DropHandler(admin.AdminRoutes):
     The only other thing it answers is the owner's admin UI (see admin.py).
     """
 
-    server_version = "FileDrop/1.0"
+    server_version = f"FileDrop/{__version__}"
     protocol_version = "HTTP/1.1"
 
     # ---- response helpers ------------------------------------------------
@@ -488,19 +369,11 @@ class DropHandler(admin.AdminRoutes):
             The metadata record for the stored file.
         """
         ts = now()
-        client_dir = os.path.join(UPLOAD_ROOT, safe_filename(client))
-        day = ts.strftime("%Y-%m-%d")
-        day_dir = os.path.join(client_dir, day)
-        os.makedirs(day_dir, exist_ok=True)
-
         orig = safe_filename(raw_filename)
-        fd, stored_name = create_unique(day_dir, orig)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-
+        rel = save_file(UPLOAD_ROOT, client, ts.strftime("%Y-%m-%d"), orig, data)
         meta: Meta = {
             "client": client,
-            "path": f"{day}/{stored_name}",
+            "path": rel,
             "original_filename": orig,
             "size": len(data),
             "content_type": content_type,
@@ -511,9 +384,7 @@ class DropHandler(admin.AdminRoutes):
             "hostname_claimed": self.headers.get("X-Client-Host", ""),
         }
 
-        with _INDEX_LOCK, open(os.path.join(client_dir, INDEX_NAME), "a") as fh:
-            fh.write(json.dumps(meta) + "\n")
-
+        append_index(UPLOAD_ROOT, client, meta)
         return meta
 
     # ---- utilities --------------------------------------------------------
@@ -553,9 +424,9 @@ def _stop(signum: int, frame: Any) -> None:
     raise KeyboardInterrupt
 
 
-def main() -> None:
-    """Load config and serve until Ctrl+C or SIGTERM."""
-    cfg = configure(load_config())
+def serve(cfg: Config) -> None:
+    """Apply ``cfg`` and serve until Ctrl+C or SIGTERM."""
+    configure(cfg)
     httpd = ThreadingHTTPServer((cfg["host"], cfg["port"]), DropHandler)
     signal.signal(signal.SIGTERM, _stop)
     print(f"File-drop server listening on http://{cfg['host']}:{cfg['port']}")
@@ -573,7 +444,3 @@ def main() -> None:
         print("\nShutting down.")
         httpd.shutdown()
         httpd.server_close()
-
-
-if __name__ == "__main__":
-    main()

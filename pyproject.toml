@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "file-dropbox"
+dynamic = ["version"]
+description = "A tiny authenticated file-drop server for your LAN, with an admin page for the owner."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Volodymyr Yahello" }]
+keywords = ["file upload", "file drop", "http server", "lan", "self-hosted"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = []  # standard library only
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[project.scripts]
+file-dropbox = "file_dropbox.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vyahello/file-dropbox"
+Issues = "https://github.com/vyahello/file-dropbox/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "file_dropbox.__version__" }
+
+[tool.setuptools.package-data]
+file_dropbox = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]  # tests run straight from a checkout, no install needed
+addopts = ["--import-mode=importlib"]

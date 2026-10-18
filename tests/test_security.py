@@ -7,11 +7,11 @@ Run:  pytest -v
 
 import pytest
 
-from security import LoginLimiter
-from security import SessionStore
-from security import client_key
-from security import hash_password
-from security import verify_password
+from file_dropbox.security import LoginLimiter
+from file_dropbox.security import SessionStore
+from file_dropbox.security import client_key
+from file_dropbox.security import hash_password
+from file_dropbox.security import verify_password
 
 
 class FakeClock:

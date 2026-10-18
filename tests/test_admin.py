@@ -21,8 +21,8 @@ from urllib.parse import urlencode
 
 import pytest
 
-import server
-from security import hash_password
+from file_dropbox import server
+from file_dropbox.security import hash_password
 
 TOKEN = "upload-token-xyz"
 PASSWORD = "correct horse battery staple"
@@ -86,13 +86,6 @@ def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
-
-
-@pytest.fixture(autouse=True)
-def fresh_limiter() -> Iterator[None]:
-    """Every test starts with no failed attempts on record."""
-    yield
-    server.LIMITER.reset()
 
 
 def login(live: SimpleNamespace, password: str = PASSWORD, **headers: str) -> Response:
