@@ -181,6 +181,23 @@ def test_same_origin_login_is_accepted(live):
     assert login(live, Origin=f"http://127.0.0.1:{live.port}")[0] == 303
 
 
+def test_browser_login_with_null_origin_is_accepted(live):
+    # What a real browser sends from our own page under a strict referrer policy.
+    assert login(live, Origin="null", **{"Sec-Fetch-Site": "same-origin"})[0] == 303
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_login_posted_from_another_site_is_refused(live, site):
+    status, _, hdrs = login(live, Origin=f"http://127.0.0.1:{live.port}", **{"Sec-Fetch-Site": site})
+    assert status == 403
+    assert "set-cookie" not in hdrs
+
+
+def test_pages_send_a_referrer_policy_that_keeps_origin(live):
+    _, _, hdrs = get(live, "/admin/login")
+    assert hdrs["referrer-policy"] == "same-origin"
+
+
 def test_made_up_session_cookie_is_ignored(live):
     status, _, _ = get(live, "/admin/", "fdb_session=" + "A" * 43)
     assert status == 303

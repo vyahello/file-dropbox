@@ -75,7 +75,9 @@ PAGE_HEADERS = {
     ),
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
+    # Not "no-referrer": with that, browsers send "Origin: null" on our own
+    # form posts, which looks cross-site. same-origin still leaks nothing.
+    "Referrer-Policy": "same-origin",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
@@ -658,10 +660,18 @@ class AdminRoutes(BaseHTTPRequestHandler):
         return "; ".join(parts)
 
     def _same_origin(self) -> bool:
-        """False if the browser says this POST came from another site."""
+        """False if the browser says this POST came from another site.
+
+        Modern browsers send ``Sec-Fetch-Site``, which pages can't forge and
+        which doesn't depend on the Host header, so it also works behind a
+        reverse proxy. Older browsers fall back to comparing Origin with Host.
+        """
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None:
+            return site in ("same-origin", "none")  # "none": typed or bookmarked by the user
         origin = self.headers.get("Origin")
         if origin is None:
-            return True  # not a browser, or an old one; SameSite still applies
+            return True  # not a browser, or a very old one; SameSite still applies
         return urlsplit(origin).netloc.lower() == self.headers.get("Host", "").lower()
 
     def _read_form(self) -> Optional[Dict[str, str]]:
