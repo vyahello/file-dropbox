@@ -1,4 +1,5 @@
-# Keep secrets, uploads and dev clutter out of the build context and the image.
+# Only pyproject.toml, README.md and src/ are needed to build the image.
+# Keep secrets, uploads and dev clutter out of the build context.
 .git
 .gitignore
 .dockerignore
@@ -7,9 +8,12 @@ config.json
 config/
 uploads/
 venv/
+.venv/
 .idea/
-__pycache__/
-*.pyc
+tests/
+build/
+dist/
+**/*.egg-info
+**/__pycache__
+**/*.pyc
 .pytest_cache/
-test_*.py
-requirements-dev.txt
