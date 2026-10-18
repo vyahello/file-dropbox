@@ -64,26 +64,28 @@ git clone https://github.com/vyahello/file-dropbox.git
 cd file-dropbox
 mkdir -p uploads config
 docker compose up -d
-docker compose logs   # shows the token and admin password, see below
+docker compose logs   # shows the token and admin sign-in, see below
 ```
 
-The first run creates `config.json` with a fresh upload token and admin
-password, and prints both:
+The first run creates `config.json` with a fresh upload token and an admin
+username and password, and prints them:
 
 ```
 ======================================================================
 No config found -> created config.json with a fresh upload token.
 Upload token (give it only to trusted clients, keep it secret):
   pX3...your-token...9Qk
-Admin password for the web UI at /admin (shown only this once):
-  Fq7...your-password...2wE
-Change it any time with: file-dropbox admin-password
+Admin sign-in for the web UI at /admin:
+  username: owner-3f9a1c
+  password: Fq7...your-password...2wE   (shown only this once)
+Change them any time with: file-dropbox admin
 ======================================================================
 File-drop server listening on http://0.0.0.0:47921
 ```
 
 Save the admin password somewhere safe. Only its hash is stored, so it won't
-be printed again (you can always set a new one).
+be printed again (you can always set a new one). The username stays readable
+in `config.json`.
 
 To send your first file from another machine:
 
@@ -181,7 +183,7 @@ print(urllib.request.urlopen(req).read().decode())
 
 ## 🔐 The admin page
 
-Open `http://SERVER_IP:47921/admin/` and sign in with the admin password.
+Open `http://SERVER_IP:47921/admin/` and sign in with the admin username and password.
 
 - **Mailbox:** every client as a pigeonhole (file count, total size, last
   delivery) and the latest server activity: deliveries, wrong tokens,
@@ -193,18 +195,24 @@ Open `http://SERVER_IP:47921/admin/` and sign in with the admin password.
 
 It works on phones too, and follows your system's light or dark theme.
 
-**Why a separate password and not the upload token?** Every client has the
+**Why a separate sign-in and not the upload token?** Every client has the
 upload token. If it also opened the admin page, any client could read every
-other client's files. The admin password stays with the owner.
+other client's files. The admin username and password stay with the owner.
 
 **How it's protected:**
 
-- The password is stored only as a salted PBKDF2-SHA256 hash (600,000 rounds).
-- 5 wrong passwords in 15 minutes locks your address out for 15 minutes. Wrong
+- The sign-in page gives nothing away: no product name, no hints, and
+  "Wrong username or password." never says which one was wrong. No response
+  carries a `Server` header, and malformed requests get the same bland JSON
+  as everything else.
+- The username is random (`owner-…`), not a guessable `admin`. The password is
+  stored only as a salted PBKDF2-SHA256 hash (600,000 rounds).
+- 5 wrong sign-ins in 15 minutes locks your address out for 15 minutes. Wrong
   upload tokens count towards the same limit.
 - Sessions use an `HttpOnly`, `SameSite=Strict` cookie and end after 30
   minutes of inactivity. Restarting the server signs everyone out.
-- Forms from other sites are refused, and signing out needs a CSRF token.
+- Forms from other sites are refused (checked with the browser's
+  `Sec-Fetch-Site` header), and signing out needs a CSRF token.
 - Pages carry a strict Content-Security-Policy (no scripts at all), can't be
   framed, and are never cached.
 - Uploaded files are never rendered as web pages. Text is escaped, only
@@ -214,15 +222,15 @@ other client's files. The admin password stays with the owner.
 - Only files inside `uploads/` are reachable. Symlinks and the `_logs` folder
   are off limits.
 
-Forgot the password, or want your own?
+Forgot the password, or want your own username and password?
 
 ```bash
-file-dropbox admin-password
-docker compose exec file-dropbox file-dropbox admin-password   # with Docker
+file-dropbox admin
+docker compose exec file-dropbox file-dropbox admin   # with Docker
 ```
 
-Type a new one (at least 12 characters) or press Enter to generate one, then
-restart the server.
+It asks for a username (Enter keeps the current one) and a password (at least
+12 characters, or Enter to generate one). Then restart the server.
 
 Don't want an admin page at all? Set `"admin_path": ""` and every `GET` is a
 `404` again.
@@ -287,6 +295,7 @@ in `./config/` with Docker). Set `FILE_DROPBOX_CONFIG` to keep it somewhere else
   "max_upload_bytes": 1073741824,
   "api_token": "<the shared token>",
   "admin_path": "/admin",
+  "admin_username": "owner-3f9a1c",
   "admin_password_hash": "pbkdf2_sha256$600000$...",
   "session_minutes": 30,
   "secure_cookies": false,
@@ -303,7 +312,8 @@ in `./config/` with Docker). Set `FILE_DROPBOX_CONFIG` to keep it somewhere else
 | `max_upload_bytes`    | 1 GiB     | Hard cap per request.                                                          |
 | `api_token`           | random    | If empty, every upload is refused with `503`.                                  |
 | `admin_path`          | `/admin`  | Where the admin page lives. Pick something less guessable if you like. `""` turns it off. |
-| `admin_password_hash` | generated | Set it with `file-dropbox admin-password`, never by hand.                      |
+| `admin_username`      | generated | Set it with `file-dropbox admin`.                                              |
+| `admin_password_hash` | generated | Set it with `file-dropbox admin`, never by hand.                               |
 | `session_minutes`     | `30`      | Idle time before the admin is signed out.                                      |
 | `secure_cookies`      | `false`   | Set `true` when the server is behind HTTPS, so the cookie is never sent over plain HTTP. |
 | `max_failed_logins`   | `5`       | Wrong tokens or passwords allowed per address...                              |
@@ -318,7 +328,7 @@ secrets. It's in `.gitignore`, so keep it out of git.
 file-dropbox token show          # print the current upload token
 file-dropbox token rotate        # new random upload token; the old one stops working
 file-dropbox token set MYTOKEN   # set a specific upload token
-file-dropbox admin-password      # set or generate a new admin password
+file-dropbox admin               # set the admin username and password
 file-dropbox --help              # everything else
 ```
 
@@ -403,7 +413,7 @@ commands change:
 | `python3 manage_token.py show`          | `file-dropbox token show`     |
 | `python3 manage_token.py rotate`        | `file-dropbox token rotate`   |
 | `python3 manage_token.py set TOKEN`     | `file-dropbox token set TOKEN` |
-| `python3 manage_token.py admin-password` | `file-dropbox admin-password` |
+| `python3 manage_token.py admin-password` | `file-dropbox admin`          |
 
 Run them from the folder that holds `config.json` and `uploads/`, since
 relative paths are resolved from where you start the command.
@@ -424,7 +434,7 @@ pytest -v
 | `tests/test_server.py`   | Uploads: auth, lockout, method rejection, both upload styles, folders, size limits, logging |
 | `tests/test_admin.py`    | Admin page: sign-in, lockout, cookies, CSRF and origin checks, browsing, previews, downloads, path traversal |
 | `tests/test_storage.py`  | File names, writing without overwriting, listing and resolving stored files |
-| `tests/test_cli.py`      | First-run config, upgrades, `0600` permissions, the token and admin-password commands |
+| `tests/test_cli.py`      | First-run config, upgrades, `0600` permissions, the token and admin commands |
 | `tests/test_security.py` | Password hashing, the lockout limiter and sessions, with a fake clock  |
 
 The server and admin tests start a real server on a random port.
@@ -442,8 +452,9 @@ on each Python version from 3.8 to 3.14 (see `.github/workflows/tests.yml`).
   cleartext. Behind HTTPS, set `"secure_cookies": true`.
 - **Behind a reverse proxy, every request comes from the proxy's address.**
   The lockout then applies to everyone at once, because `X-Forwarded-For` is
-  deliberately not trusted (anyone could fake it). Make the proxy pass the
-  original `Host` header, or the admin forms will be refused as cross-site.
+  deliberately not trusted (anyone could fake it). Also let the proxy pass the
+  original `Host` header: very old browsers that don't send `Sec-Fetch-Site`
+  are checked against it.
 - **Everyone shares one token.** Anyone who has it can upload under any
   `X-Client-Id`. `source_ip` comes from the real socket; `X-Client-Id`,
   `X-Client-Host` and `user_agent` are whatever the client says. Treat them as
